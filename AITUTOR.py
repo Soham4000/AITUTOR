@@ -298,16 +298,66 @@ def _wrap_by_measured_width(pdf: FPDF, text: str, max_width: float) -> list:
     return lines or [""]
 
 
+def _safe_multi_cell(pdf: FPDF, w: float, h: int, text: str, max_attempts: int = 8):
+    """
+    Last-resort safety net: if multi_cell still raises an exception for
+    some edge case not covered above, progressively halve the line
+    instead of letting the whole PDF export crash. In the worst case a
+    stubborn line gets truncated — the download always succeeds.
+    """
+
+    remaining = text
+
+    for _ in range(max_attempts):
+
+        try:
+            pdf.multi_cell(w, h, remaining)
+            return
+
+        except Exception:
+            if len(remaining) <= 1:
+                return
+            remaining = remaining[: max(1, len(remaining) // 2)]
+
+    # Final fallback: try a single blank line rather than propagate.
+    try:
+        pdf.multi_cell(w, h, "")
+    except Exception:
+        pass
+
+
 def _write_cell(pdf: FPDF, text: str, line_height: int):
     """
     Renders `text`, pre-wrapped to fit the page width for the currently
     active font, one guaranteed-to-fit line per multi_cell call.
+
+    Three defensive measures beyond the width-measurement wrap itself:
+      1. A safety buffer subtracted from the wrap width, to account for
+         multi_cell's internal cell padding (c_margin, ~1mm per side)
+         which get_string_width() does not know about. Without this,
+         a line built to exactly fill the page width can be a hair too
+         wide once multi_cell reserves its own internal padding.
+      2. pdf.set_x() forced back to the left margin before every single
+         line, so we never depend on multi_cell's (version-dependent)
+         behavior of resetting the cursor after a previous call.
+      3. An explicit non-zero cell width passed to multi_cell (instead
+         of the "0 = auto to right margin" shorthand), which internally
+         is computed from the CURRENT x position on some fpdf2 versions
+         — meaning it can silently shrink if x drifted. Passing the
+         width explicitly removes that dependency entirely.
+      4. _safe_multi_cell as a hard backstop, so no remaining edge case
+         can crash the export outright.
     """
 
-    max_width = pdf.w - pdf.l_margin - pdf.r_margin
+    content_width = pdf.w - pdf.l_margin - pdf.r_margin
 
-    for line in _wrap_by_measured_width(pdf, text, max_width):
-        pdf.multi_cell(0, line_height, line)
+    c_margin = getattr(pdf, "c_margin", 1.0) or 1.0
+    safety_buffer = max(2 * c_margin + 1.0, 3.0)  # generous, cheap insurance
+    usable_width = max(content_width - safety_buffer, content_width * 0.5)
+
+    for line in _wrap_by_measured_width(pdf, text, usable_width):
+        pdf.set_x(pdf.l_margin)
+        _safe_multi_cell(pdf, content_width, line_height, line)
 
 
 def generate_pdf_bytes(content: str, title: str) -> bytes:
