@@ -2,3 +2,4 @@ streamlit
 google-generativeai
 pypdf
 fpdf2
+pandas
