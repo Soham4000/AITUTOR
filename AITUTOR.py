@@ -1,6 +1,7 @@
 import io
 import os
 
+import pandas as pd
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
@@ -473,6 +474,7 @@ def render_pdf_download_button(content: str, title: str, filename: str, key: str
         )
 
 
+
 # ============================================================
 # SESSION STATE
 # ============================================================
@@ -480,9 +482,19 @@ def render_pdf_download_button(content: str, title: str, filename: str, key: str
 _DEFAULT_STATE = {
     "pdf_text": "",
     "teacher_response": "",
-    "notes_response": "",
+    "lesson_response": "",
+    "assignment_response": "",
     "questions_response": "",
+    "teaching_material_response": "",
+    "student_learning_response": "",
+    "student_doubt_response": "",
+    "notes_response": "",
     "mcqs_response": "",
+    "quiz_questions": [],
+    "quiz_answers": {},
+    "quiz_score": None,
+    "student_analysis_response": "",
+    "uploaded_student_data": None,
     "pdf_qa_response": "",
 }
 
@@ -524,194 +536,1211 @@ user_mode = st.sidebar.selectbox(
 
 difficulty = st.sidebar.selectbox(
     "Difficulty Level",
-    [
-        "Easy",
-        "Medium",
-        "Hard",
-        "Mixed"
-    ]
+    ["Easy", "Medium", "Hard", "Mixed"]
 )
 
 education_level = st.sidebar.selectbox(
     "Education Level",
-    [
-        "School",
-        "Diploma",
-        "Undergraduate",
-        "Postgraduate"
-    ]
+    ["School", "Diploma", "Undergraduate", "Postgraduate"]
 )
 
 response_language = st.sidebar.selectbox(
     "Response Language",
-    [
-        "English",
-        "Hindi",
-        "Bengali"
-    ]
+    ["English", "Hindi", "Bengali"]
+)
+
+st.sidebar.info(
+    "Teacher Mode provides teaching, assessment and student-analysis tools. "
+    "Student Mode provides learning, doubt-solving and practice tools."
 )
 
 
 # ============================================================
-# MAIN TABS
+# COMMON HELPER
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    [
-        "💬 AI Teacher",
-        "📚 Notes",
-        "❓ Questions",
-        "📝 MCQs",
-        "📄 PDF Assistant"
-    ]
-)
+def show_generated_content(
+    state_key: str,
+    heading: str,
+    title: str,
+    filename: str,
+    pdf_key: str
+):
+    content = st.session_state.get(state_key, "")
 
+    if content:
+        st.subheader(heading)
+        st.markdown(content)
 
-# ============================================================
-# TAB 1 — AI TEACHER
-# ============================================================
-
-with tab1:
-
-    st.header("💬 Ask the AI Teacher")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        subject = st.text_input(
-            "Subject",
-            placeholder="Example: Machine Learning"
-        )
-
-    with col2:
-
-        topic = st.text_input(
-            "Topic",
-            placeholder="Example: Random Forest"
-        )
-
-    question = st.text_area(
-        "What do you want to learn?",
-        placeholder=(
-            "Example: Explain Random Forest with a simple example."
-        ),
-        height=150
-    )
-
-    if st.button(
-        "🤖 Ask Gemini",
-        key="ask_teacher",
-        use_container_width=True
-    ):
-
-        if not question.strip():
-
-            st.warning("Please enter your question.")
-
-        else:
-
-            prompt = f"""
-You are an expert AI Teaching Assistant.
-
-Education level:
-{education_level}
-
-Subject:
-{subject}
-
-Topic:
-{topic}
-
-Difficulty:
-{difficulty}
-
-Response language:
-{response_language}
-
-Student/teacher mode:
-{user_mode}
-
-Question:
-{question}
-
-Instructions:
-
-1. Explain the concept clearly.
-2. Use simple language where appropriate.
-3. Give examples.
-4. Use headings and bullet points.
-5. Include important points.
-6. If useful, include a real-world example.
-7. Do not provide irrelevant information.
-"""
-
-            with st.spinner("Gemini is preparing the answer..."):
-
-                answer = ask_gemini(prompt)
-
-            st.session_state.teacher_response = answer
-
-    if st.session_state.teacher_response:
-
-        st.subheader("🤖 AI Teacher Response")
-
-        st.markdown(st.session_state.teacher_response)
-
-        if is_gemini_error(st.session_state.teacher_response):
-            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        if is_gemini_error(content):
+            st.caption(
+                "⚠️ This looks like an API error, not generated content — "
+                "no PDF export offered."
+            )
         else:
             render_pdf_download_button(
-                st.session_state.teacher_response,
-                title=f"AI Teacher — {subject or 'Response'}",
-                filename="ai_teacher_response.pdf",
-                key="pdf_download_teacher",
+                content,
+                title=title,
+                filename=filename,
+                key=pdf_key,
             )
 
 
 # ============================================================
-# TAB 2 — NOTES GENERATOR
+# TEACHER MODE
 # ============================================================
 
-with tab2:
+if user_mode == "👨‍🏫 Teacher":
 
-    st.header("📚 AI Notes Generator")
+    teacher_tabs = st.tabs([
+        "📘 Create Lesson",
+        "📝 Question Paper",
+        "📚 Assignments",
+        "👥 Analyze Students",
+        "🎨 Teaching Material",
+        "📄 PDF Assistant",
+    ])
 
-    notes_subject = st.text_input(
-        "Subject",
-        placeholder="Example: Artificial Intelligence",
-        key="notes_subject"
-    )
+    # --------------------------------------------------------
+    # TEACHER — CREATE LESSON
+    # --------------------------------------------------------
 
-    notes_topic = st.text_input(
-        "Topic",
-        placeholder="Example: Neural Networks",
-        key="notes_topic"
-    )
+    with teacher_tabs[0]:
 
-    notes_length = st.selectbox(
-        "Notes Length",
-        [
-            "Short",
-            "Medium",
-            "Detailed"
-        ]
-    )
+        st.header("📘 Create a Lesson Plan")
 
-    if st.button(
+        col1, col2 = st.columns(2)
+
+        with col1:
+            lesson_subject = st.text_input(
+                "Subject",
+                placeholder="Example: Machine Learning",
+                key="lesson_subject"
+            )
+
+        with col2:
+            lesson_topic = st.text_input(
+                "Topic",
+                placeholder="Example: Decision Trees",
+                key="lesson_topic"
+            )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            lesson_duration = st.selectbox(
+                "Class Duration",
+                ["30 minutes", "45 minutes", "60 minutes", "90 minutes"],
+                key="lesson_duration"
+            )
+
+        with col2:
+            lesson_level = st.selectbox(
+                "Student Level",
+                ["Beginner", "Intermediate", "Advanced"],
+                key="lesson_level"
+            )
+
+        with col3:
+            lesson_style = st.selectbox(
+                "Teaching Style",
+                [
+                    "Lecture",
+                    "Interactive",
+                    "Activity Based",
+                    "Discussion Based",
+                    "Mixed"
+                ],
+                key="lesson_style"
+            )
+
+        lesson_objectives = st.text_area(
+            "Learning Objectives",
+            placeholder=(
+                "Example: Students should understand the concept, "
+                "build a simple model and explain its applications."
+            ),
+            key="lesson_objectives"
+        )
+
+        if st.button(
+            "📘 Create Lesson Plan",
+            key="create_lesson",
+            use_container_width=True
+        ):
+
+            if not lesson_topic.strip():
+                st.warning("Please enter a lesson topic.")
+            else:
+
+                prompt = f"""
+You are an expert university teacher and lesson-plan designer.
+
+Create a complete lesson plan.
+
+Subject:
+{lesson_subject}
+
+Topic:
+{lesson_topic}
+
+Class Duration:
+{lesson_duration}
+
+Student Level:
+{lesson_level}
+
+Teaching Style:
+{lesson_style}
+
+Learning Objectives:
+{lesson_objectives}
+
+Education Level:
+{education_level}
+
+Difficulty:
+{difficulty}
+
+Language:
+{response_language}
+
+Include:
+
+1. Lesson title
+2. Learning objectives
+3. Prerequisites
+4. Introduction / warm-up
+5. Key concepts to teach
+6. Step-by-step teaching sequence
+7. Examples
+8. Real-world application
+9. Interactive classroom activity
+10. Questions the teacher can ask during class
+11. Common student mistakes
+12. Quick assessment
+13. Homework
+14. Summary
+15. Estimated time for each section
+
+Make the plan practical and classroom-ready.
+"""
+
+                with st.spinner("Creating lesson plan..."):
+                    st.session_state.lesson_response = ask_gemini(prompt)
+
+        show_generated_content(
+            "lesson_response",
+            "📘 Generated Lesson Plan",
+            f"Lesson Plan — {st.session_state.get('lesson_topic', 'Lesson')}",
+            "lesson_plan.pdf",
+            "pdf_download_lesson",
+        )
+
+    # --------------------------------------------------------
+    # TEACHER — QUESTION PAPER
+    # --------------------------------------------------------
+
+    with teacher_tabs[1]:
+
+        st.header("📝 Question Paper Generator")
+
+        q_subject = st.text_input(
+            "Subject",
+            key="teacher_q_subject"
+        )
+
+        q_topics = st.text_area(
+            "Topics / Units",
+            placeholder=(
+                "Unit 1: Introduction\n"
+                "Unit 2: Supervised Learning\n"
+                "Unit 3: Classification"
+            ),
+            key="teacher_q_topics"
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            number_questions = st.number_input(
+                "Number of Questions",
+                min_value=1,
+                max_value=50,
+                value=10,
+                key="teacher_number_questions"
+            )
+
+        with col2:
+            marks = st.selectbox(
+                "Marks per Question",
+                [1, 2, 5, 10, 15],
+                key="teacher_marks"
+            )
+
+        with col3:
+            question_type = st.selectbox(
+                "Question Type",
+                [
+                    "Short Answer",
+                    "Long Answer",
+                    "Very Long Answer",
+                    "Viva Questions",
+                    "Mixed"
+                ],
+                key="teacher_question_type"
+            )
+
+        include_answers = st.checkbox(
+            "Include answer key / marking hints",
+            value=False,
+            key="teacher_include_answers"
+        )
+
+        if st.button(
+            "📝 Generate Question Paper",
+            key="generate_teacher_questions",
+            use_container_width=True
+        ):
+
+            if not q_topics.strip():
+                st.warning("Please enter topics or units.")
+            else:
+
+                answer_part = (
+                    "After the question paper, provide an answer key "
+                    "or concise marking hints."
+                    if include_answers
+                    else
+                    "Do not provide answers unless necessary."
+                )
+
+                prompt = f"""
+You are an expert university examination-paper designer.
+
+Create a professional question paper.
+
+Subject:
+{q_subject}
+
+Topics / Units:
+{q_topics}
+
+Number of Questions:
+{number_questions}
+
+Marks per Question:
+{marks}
+
+Question Type:
+{question_type}
+
+Difficulty:
+{difficulty}
+
+Education Level:
+{education_level}
+
+Language:
+{response_language}
+
+Requirements:
+
+1. Cover the supplied topics.
+2. Avoid duplicate questions.
+3. Balance conceptual and application-based questions.
+4. Match the selected difficulty.
+5. Number every question.
+6. Make the paper suitable for the selected education level.
+7. Keep marks consistent.
+8. Format it like a real examination paper.
+
+{answer_part}
+"""
+
+                with st.spinner("Generating question paper..."):
+                    st.session_state.questions_response = ask_gemini(prompt)
+
+        show_generated_content(
+            "questions_response",
+            "📝 Generated Question Paper",
+            f"Question Paper — {st.session_state.get('teacher_q_subject', 'Exam')}",
+            "question_paper.pdf",
+            "pdf_download_teacher_questions",
+        )
+
+    # --------------------------------------------------------
+    # TEACHER — ASSIGNMENTS
+    # --------------------------------------------------------
+
+    with teacher_tabs[2]:
+
+        st.header("📚 Assignment Generator")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            assignment_subject = st.text_input(
+                "Subject",
+                placeholder="Example: Artificial Intelligence",
+                key="assignment_subject"
+            )
+
+        with col2:
+            assignment_topic = st.text_input(
+                "Topic",
+                placeholder="Example: Neural Networks",
+                key="assignment_topic"
+            )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            assignment_type = st.selectbox(
+                "Assignment Type",
+                [
+                    "Theory",
+                    "Programming",
+                    "Case Study",
+                    "Research",
+                    "Practical",
+                    "Mixed"
+                ],
+                key="assignment_type"
+            )
+
+        with col2:
+            assignment_count = st.number_input(
+                "Number of Tasks",
+                min_value=1,
+                max_value=30,
+                value=5,
+                key="assignment_count"
+            )
+
+        with col3:
+            assignment_time = st.selectbox(
+                "Expected Completion",
+                ["1 hour", "2 hours", "1 day", "3 days", "1 week"],
+                key="assignment_time"
+            )
+
+        assignment_requirements = st.text_area(
+            "Special Requirements",
+            placeholder="Example: Include one real-world case study and one coding task.",
+            key="assignment_requirements"
+        )
+
+        if st.button(
+            "📚 Generate Assignment",
+            key="generate_assignment",
+            use_container_width=True
+        ):
+
+            if not assignment_topic.strip():
+                st.warning("Please enter an assignment topic.")
+            else:
+
+                prompt = f"""
+You are an expert college teacher.
+
+Create a complete student assignment.
+
+Subject:
+{assignment_subject}
+
+Topic:
+{assignment_topic}
+
+Assignment Type:
+{assignment_type}
+
+Number of Tasks:
+{assignment_count}
+
+Expected Completion:
+{assignment_time}
+
+Difficulty:
+{difficulty}
+
+Education Level:
+{education_level}
+
+Language:
+{response_language}
+
+Special Requirements:
+{assignment_requirements}
+
+Include:
+
+1. Assignment title
+2. Background / introduction
+3. Learning objectives
+4. Instructions for students
+5. Clearly numbered tasks
+6. Mix of conceptual and practical work where appropriate
+7. Expected submission format
+8. Evaluation / marking rubric
+9. Academic integrity reminder
+10. Expected learning outcomes
+
+Make it realistic and classroom-ready.
+"""
+
+                with st.spinner("Generating assignment..."):
+                    st.session_state.assignment_response = ask_gemini(prompt)
+
+        show_generated_content(
+            "assignment_response",
+            "📚 Generated Assignment",
+            f"Assignment — {st.session_state.get('assignment_topic', 'Assignment')}",
+            "assignment.pdf",
+            "pdf_download_assignment",
+        )
+
+    # --------------------------------------------------------
+    # TEACHER — ANALYZE STUDENTS
+    # --------------------------------------------------------
+
+    with teacher_tabs[3]:
+
+        st.header("👥 Student Performance Analysis")
+
+        st.write(
+            "Upload a CSV containing student records. The assistant can "
+            "identify risk patterns and generate student-specific suggestions."
+        )
+
+        student_file = st.file_uploader(
+            "Upload Student CSV",
+            type=["csv"],
+            key="student_csv"
+        )
+
+        if student_file:
+
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(student_file)
+                st.session_state.uploaded_student_data = df
+
+                st.success(
+                    f"Student data loaded successfully: {len(df)} records."
+                )
+
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                student_id_column = None
+
+                for column in df.columns:
+                    if str(column).strip().lower() in [
+                        "student id",
+                        "student_id",
+                        "studentid"
+                    ]:
+                        student_id_column = column
+                        break
+
+                if student_id_column:
+
+                    student_ids = df[student_id_column].astype(str).tolist()
+
+                    selected_id = st.selectbox(
+                        "Select Student ID",
+                        student_ids,
+                        key="selected_student_id"
+                    )
+
+                    selected_row = df[
+                        df[student_id_column].astype(str) == str(selected_id)
+                    ]
+
+                    if not selected_row.empty:
+
+                        student = selected_row.iloc[0]
+
+                        st.subheader("📊 Selected Student")
+
+                        st.dataframe(
+                            selected_row,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        attendance = None
+                        risk_value = None
+
+                        for column in df.columns:
+                            normalized = str(column).strip().lower()
+
+                            if normalized == "attendance_percent":
+                                attendance = student[column]
+
+                            if normalized == "at_risk":
+                                risk_value = student[column]
+
+                        low_attendance = False
+
+                        if attendance is not None:
+                            try:
+                                low_attendance = float(attendance) < 75
+                            except Exception:
+                                low_attendance = False
+
+                        at_risk = (
+                            str(risk_value).strip().lower()
+                            in ["yes", "true", "1"]
+                            if risk_value is not None
+                            else False
+                        )
+
+                        if low_attendance or at_risk:
+
+                            st.warning(
+                                "⚠️ This student requires attention: "
+                                "Attendance < 75% or At_Risk is Yes."
+                            )
+
+                            if st.button(
+                                "🤖 Generate Student-Specific Suggestions",
+                                key="generate_student_suggestions",
+                                use_container_width=True
+                            ):
+
+                                student_details = "\n".join(
+                                    f"{column}: {student[column]}"
+                                    for column in df.columns
+                                )
+
+                                prompt = f"""
+You are an academic student-support assistant.
+
+Analyze ONLY the selected student's information.
+
+Student record:
+----------------
+{student_details}
+----------------
+
+Attendance below 75%:
+{low_attendance}
+
+At-risk flag:
+{at_risk}
+
+Education level:
+{education_level}
+
+Language:
+{response_language}
+
+Generate practical, personalized academic suggestions.
+
+Include:
+
+1. Main areas of concern
+2. Possible academic impact
+3. Attendance improvement suggestions if relevant
+4. Study-time suggestions if relevant
+5. Exam preparation suggestions
+6. Subject-learning suggestions based on the available fields
+7. Short-term action plan
+8. Weekly improvement plan
+9. Encouraging conclusion
+
+Do not give generic advice unrelated to the student's actual record.
+Do not invent missing student information.
+"""
+
+                                with st.spinner(
+                                    "Analyzing selected student..."
+                                ):
+                                    st.session_state.student_analysis_response = ask_gemini(
+                                        prompt
+                                    )
+
+                        else:
+
+                            st.success(
+                                "✅ This student does not currently meet "
+                                "the configured Gemini-support condition."
+                            )
+
+                        show_generated_content(
+                            "student_analysis_response",
+                            "🤖 Personalized Student Suggestions",
+                            f"Student Analysis — {selected_id}",
+                            "student_analysis.pdf",
+                            "pdf_download_student_analysis",
+                        )
+
+                    else:
+                        st.warning("Selected student could not be found.")
+
+                else:
+                    st.error(
+                        "The CSV needs a Student ID column "
+                        "(for example: Student ID)."
+                    )
+
+            except Exception as e:
+                st.error(f"Could not read the student CSV: {e}")
+
+        st.markdown("---")
+        st.subheader("📈 Class-Level Risk Overview")
+
+        df = st.session_state.get("uploaded_student_data")
+
+        if df is not None:
+
+            try:
+
+                attendance_column = next(
+                    (
+                        c for c in df.columns
+                        if str(c).strip().lower() == "attendance_percent"
+                    ),
+                    None
+                )
+
+                risk_column = next(
+                    (
+                        c for c in df.columns
+                        if str(c).strip().lower() == "at_risk"
+                    ),
+                    None
+                )
+
+                if attendance_column or risk_column:
+
+                    risk_mask = False
+
+                    if attendance_column:
+                        numeric_attendance = pd.to_numeric(
+                            df[attendance_column],
+                            errors="coerce"
+                        )
+                        risk_mask = numeric_attendance < 75
+
+                    if risk_column:
+                        flag_mask = (
+                            df[risk_column]
+                            .astype(str)
+                            .str.strip()
+                            .str.lower()
+                            .isin(["yes", "true", "1"])
+                        )
+
+                        risk_mask = risk_mask | flag_mask
+
+                    risk_count = int(risk_mask.sum())
+                    total_count = len(df)
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        st.metric("Total Students", total_count)
+
+                    with col2:
+                        st.metric("Students Requiring Attention", risk_count)
+
+                    with col3:
+                        percentage = (
+                            round((risk_count / total_count) * 100, 1)
+                            if total_count else 0
+                        )
+                        st.metric("Attention Rate", f"{percentage}%")
+
+                else:
+                    st.info(
+                        "Class-level risk overview needs "
+                        "Attendance_Percent and/or At_Risk."
+                    )
+
+            except Exception as e:
+                st.warning(f"Could not calculate class risk overview: {e}")
+
+    # --------------------------------------------------------
+    # TEACHER — TEACHING MATERIAL
+    # --------------------------------------------------------
+
+    with teacher_tabs[4]:
+
+        st.header("🎨 Teaching Material Generator")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            material_subject = st.text_input(
+                "Subject",
+                key="material_subject",
+                placeholder="Example: Data Science"
+            )
+
+        with col2:
+            material_topic = st.text_input(
+                "Topic",
+                key="material_topic",
+                placeholder="Example: Data Preprocessing"
+            )
+
+        material_type = st.selectbox(
+            "Material Type",
+            [
+                "Lecture Notes",
+                "Class Handout",
+                "Presentation Outline",
+                "Blackboard / Whiteboard Plan",
+                "Classroom Activity",
+                "Case Study",
+                "Revision Sheet",
+                "Lab Exercise",
+                "Viva Preparation Material"
+            ],
+            key="material_type"
+        )
+
+        material_length = st.selectbox(
+            "Material Length",
+            ["Short", "Medium", "Detailed"],
+            key="material_length"
+        )
+
+        material_extra = st.text_area(
+            "Additional Instructions",
+            placeholder="Example: Include examples suitable for BTech students.",
+            key="material_extra"
+        )
+
+        if st.button(
+            "🎨 Generate Teaching Material",
+            key="generate_teaching_material",
+            use_container_width=True
+        ):
+
+            if not material_topic.strip():
+                st.warning("Please enter a topic.")
+            else:
+
+                prompt = f"""
+You are an expert teacher and academic-content designer.
+
+Create {material_length.lower()} teaching material.
+
+Subject:
+{material_subject}
+
+Topic:
+{material_topic}
+
+Material Type:
+{material_type}
+
+Education Level:
+{education_level}
+
+Difficulty:
+{difficulty}
+
+Language:
+{response_language}
+
+Additional Instructions:
+{material_extra}
+
+Make the material classroom-ready.
+
+Where appropriate include:
+- Learning objectives
+- Key definitions
+- Important concepts
+- Examples
+- Diagrams described in words
+- Real-world applications
+- Classroom activities
+- Common misconceptions
+- Important examination points
+- Summary
+
+For a presentation outline, organize the output slide-by-slide.
+For a lab exercise, include objective, requirements, procedure and expected output.
+For a case study, include scenario, questions and expected learning outcomes.
+"""
+
+                with st.spinner("Generating teaching material..."):
+                    st.session_state.teaching_material_response = ask_gemini(
+                        prompt
+                    )
+
+        show_generated_content(
+            "teaching_material_response",
+            "🎨 Generated Teaching Material",
+            f"Teaching Material — {st.session_state.get('material_topic', 'Topic')}",
+            "teaching_material.pdf",
+            "pdf_download_teaching_material",
+        )
+
+    # --------------------------------------------------------
+    # TEACHER — PDF ASSISTANT
+    # --------------------------------------------------------
+
+    with teacher_tabs[5]:
+
+        st.header("📄 Teacher PDF Assistant")
+
+        uploaded_pdf = st.file_uploader(
+            "Upload a teaching material PDF",
+            type=["pdf"],
+            key="teacher_pdf_upload"
+        )
+
+        if uploaded_pdf:
+
+            if st.button(
+                "📖 Read PDF",
+                key="teacher_read_pdf",
+                use_container_width=True
+            ):
+
+                with st.spinner("Reading PDF..."):
+                    st.session_state.pdf_text = extract_pdf_text(
+                        uploaded_pdf
+                    )
+
+                if st.session_state.pdf_text.strip():
+
+                    st.success("PDF successfully processed.")
+
+                    st.info(
+                        f"Extracted approximately "
+                        f"{len(st.session_state.pdf_text)} characters."
+                    )
+
+                else:
+                    st.error("Could not extract text from this PDF.")
+
+        if st.session_state.pdf_text:
+
+            pdf_question = st.text_area(
+                "Ask something about the teaching material",
+                placeholder="Example: Create five discussion questions from Unit 1.",
+                height=130,
+                key="teacher_pdf_question"
+            )
+
+            if st.button(
+                "🤖 Ask About PDF",
+                key="teacher_pdf_ask",
+                use_container_width=True
+            ):
+
+                if not pdf_question.strip():
+                    st.warning("Please enter a question.")
+                else:
+
+                    material = st.session_state.pdf_text[:50000]
+
+                    prompt = f"""
+You are an AI Teaching Assistant helping a teacher.
+
+Use the supplied teaching material to answer the request.
+
+Teaching Material:
+----------------
+{material}
+----------------
+
+Teacher Request:
+{pdf_question}
+
+Education Level:
+{education_level}
+
+Language:
+{response_language}
+
+Instructions:
+
+1. Base the response primarily on the supplied material.
+2. Do not invent information.
+3. Clearly say when the material does not contain the answer.
+4. Make the result practical for teaching.
+5. Use headings and bullet points where appropriate.
+"""
+
+                    with st.spinner("Analyzing teaching material..."):
+                        st.session_state.pdf_qa_response = ask_gemini(prompt)
+
+        show_generated_content(
+            "pdf_qa_response",
+            "🤖 AI Answer",
+            "Teacher PDF Assistant — Answer",
+            "teacher_pdf_answer.pdf",
+            "pdf_download_teacher_pdf",
+        )
+
+
+# ============================================================
+# STUDENT MODE
+# ============================================================
+
+else:
+
+    student_tabs = st.tabs([
+        "🧠 Learn Topic",
+        "❓ Ask Doubts",
         "📚 Generate Notes",
-        key="generate_notes",
-        use_container_width=True
-    ):
+        "📝 Practice MCQs",
+        "🎯 Take Quiz",
+        "📄 PDF Assistant",
+    ])
 
-        if not notes_topic.strip():
+    # --------------------------------------------------------
+    # STUDENT — LEARN TOPIC
+    # --------------------------------------------------------
 
-            st.warning("Please enter a topic.")
+    with student_tabs[0]:
 
-        else:
+        st.header("🧠 Learn a Topic")
 
-            prompt = f"""
-You are an expert college teaching assistant.
+        col1, col2 = st.columns(2)
+
+        with col1:
+            learn_subject = st.text_input(
+                "Subject",
+                placeholder="Example: Machine Learning",
+                key="learn_subject"
+            )
+
+        with col2:
+            learn_topic = st.text_input(
+                "Topic",
+                placeholder="Example: Random Forest",
+                key="learn_topic"
+            )
+
+        learning_goal = st.selectbox(
+            "What do you want to do?",
+            [
+                "Understand the basics",
+                "Prepare for an exam",
+                "Understand with examples",
+                "Learn step by step",
+                "Revise quickly"
+            ],
+            key="learning_goal"
+        )
+
+        if st.button(
+            "🧠 Start Learning",
+            key="start_learning",
+            use_container_width=True
+        ):
+
+            if not learn_topic.strip():
+                st.warning("Please enter a topic.")
+            else:
+
+                prompt = f"""
+You are a friendly AI tutor.
+
+Teach the student the following topic.
+
+Subject:
+{learn_subject}
+
+Topic:
+{learn_topic}
+
+Student Goal:
+{learning_goal}
+
+Education Level:
+{education_level}
+
+Difficulty:
+{difficulty}
+
+Language:
+{response_language}
+
+Teach from basic to advanced only as appropriate.
+
+Include:
+
+1. Simple introduction
+2. Definition
+3. Why the topic matters
+4. Step-by-step explanation
+5. Simple example
+6. Real-world example
+7. Important terms
+8. Common mistakes
+9. Exam-important points
+10. Quick recap
+11. Three self-check questions
+
+Use clear student-friendly language.
+"""
+
+                with st.spinner("Preparing your lesson..."):
+                    st.session_state.student_learning_response = ask_gemini(
+                        prompt
+                    )
+
+        show_generated_content(
+            "student_learning_response",
+            "🧠 Your Lesson",
+            f"Learning — {st.session_state.get('learn_topic', 'Topic')}",
+            "student_learning.pdf",
+            "pdf_download_student_learning",
+        )
+
+    # --------------------------------------------------------
+    # STUDENT — ASK DOUBTS
+    # --------------------------------------------------------
+
+    with student_tabs[1]:
+
+        st.header("❓ Ask Your Doubt")
+
+        doubt_subject = st.text_input(
+            "Subject",
+            key="doubt_subject",
+            placeholder="Example: Computer Networks"
+        )
+
+        doubt_topic = st.text_input(
+            "Topic",
+            key="doubt_topic",
+            placeholder="Example: TCP vs UDP"
+        )
+
+        doubt = st.text_area(
+            "Describe your doubt",
+            placeholder=(
+                "Example: I understand TCP is reliable, but why is UDP "
+                "used for streaming?"
+            ),
+            height=170,
+            key="student_doubt"
+        )
+
+        if st.button(
+            "🤖 Explain My Doubt",
+            key="explain_doubt",
+            use_container_width=True
+        ):
+
+            if not doubt.strip():
+                st.warning("Please describe your doubt.")
+            else:
+
+                prompt = f"""
+You are a patient personal AI tutor.
+
+A student has asked the following doubt.
+
+Subject:
+{doubt_subject}
+
+Topic:
+{doubt_topic}
+
+Student's Doubt:
+{doubt}
+
+Education Level:
+{education_level}
+
+Difficulty:
+{difficulty}
+
+Language:
+{response_language}
+
+Answer the exact doubt.
+
+Instructions:
+
+1. First identify what the student is confused about.
+2. Explain it step by step.
+3. Use a simple analogy if useful.
+4. Give an example.
+5. Correct any misconception gently.
+6. End with a short takeaway.
+7. Do not overwhelm the student with unrelated theory.
+"""
+
+                with st.spinner("Solving your doubt..."):
+                    st.session_state.student_doubt_response = ask_gemini(
+                        prompt
+                    )
+
+        show_generated_content(
+            "student_doubt_response",
+            "🤖 Explanation",
+            "Student Doubt — Explanation",
+            "doubt_explanation.pdf",
+            "pdf_download_student_doubt",
+        )
+
+    # --------------------------------------------------------
+    # STUDENT — NOTES
+    # --------------------------------------------------------
+
+    with student_tabs[2]:
+
+        st.header("📚 Generate Study Notes")
+
+        notes_subject = st.text_input(
+            "Subject",
+            placeholder="Example: Artificial Intelligence",
+            key="student_notes_subject"
+        )
+
+        notes_topic = st.text_input(
+            "Topic",
+            placeholder="Example: Neural Networks",
+            key="student_notes_topic"
+        )
+
+        notes_length = st.selectbox(
+            "Notes Length",
+            ["Short", "Medium", "Detailed"],
+            key="student_notes_length"
+        )
+
+        notes_purpose = st.selectbox(
+            "Purpose",
+            [
+                "General Study",
+                "Exam Preparation",
+                "Quick Revision",
+                "Viva Preparation"
+            ],
+            key="student_notes_purpose"
+        )
+
+        if st.button(
+            "📚 Generate Notes",
+            key="generate_student_notes",
+            use_container_width=True
+        ):
+
+            if not notes_topic.strip():
+                st.warning("Please enter a topic.")
+            else:
+
+                prompt = f"""
+You are an expert student study assistant.
 
 Create {notes_length.lower()} study notes.
 
@@ -720,6 +1749,9 @@ Subject:
 
 Topic:
 {notes_topic}
+
+Purpose:
+{notes_purpose}
 
 Education Level:
 {education_level}
@@ -735,232 +1767,231 @@ Include:
 1. Introduction
 2. Definition
 3. Important concepts
-4. Detailed explanation
+4. Clear explanation
 5. Examples
 6. Advantages
 7. Disadvantages
 8. Applications
-9. Important points for examinations
-10. Short conclusion
+9. Important examination points
+10. Quick revision summary
+11. Five key terms
 
-Format the answer using clear headings and bullet points.
+Use student-friendly formatting.
 """
 
-            with st.spinner("Generating notes..."):
+                with st.spinner("Generating study notes..."):
+                    st.session_state.notes_response = ask_gemini(prompt)
 
-                notes = ask_gemini(prompt)
+        show_generated_content(
+            "notes_response",
+            "📖 Your Study Notes",
+            f"Notes — {st.session_state.get('student_notes_topic', 'Study Notes')}",
+            "study_notes.pdf",
+            "pdf_download_student_notes",
+        )
 
-            st.session_state.notes_response = notes
+    # --------------------------------------------------------
+    # STUDENT — PRACTICE MCQs
+    # --------------------------------------------------------
 
-    if st.session_state.notes_response:
+    with student_tabs[3]:
 
-        st.subheader("📖 Generated Notes")
+        st.header("📝 Practice MCQs")
 
-        st.markdown(st.session_state.notes_response)
+        col1, col2 = st.columns(2)
 
-        if is_gemini_error(st.session_state.notes_response):
-            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
-        else:
-            render_pdf_download_button(
-                st.session_state.notes_response,
-                title=f"Notes — {notes_topic or 'Study Notes'}",
-                filename="study_notes.pdf",
-                key="pdf_download_notes",
+        with col1:
+            practice_subject = st.text_input(
+                "Subject",
+                key="practice_subject",
+                placeholder="Example: Python"
             )
 
+        with col2:
+            practice_topic = st.text_input(
+                "Topic",
+                key="practice_topic",
+                placeholder="Example: OOP"
+            )
 
-# ============================================================
-# TAB 3 — QUESTION GENERATOR
-# ============================================================
-
-with tab3:
-
-    st.header("❓ Question Paper Generator")
-
-    q_subject = st.text_input(
-        "Subject",
-        key="q_subject"
-    )
-
-    q_topics = st.text_area(
-        "Topics / Units",
-        placeholder=(
-            "Unit 1: Introduction\n"
-            "Unit 2: Supervised Learning\n"
-            "Unit 3: Classification"
-        )
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        number_questions = st.number_input(
-            "Number of Questions",
+        practice_count = st.number_input(
+            "Number of MCQs",
             min_value=1,
-            max_value=50,
-            value=10
+            max_value=20,
+            value=5,
+            key="practice_count"
         )
 
-    with col2:
+        if st.button(
+            "📝 Generate Practice Questions",
+            key="generate_practice_mcqs",
+            use_container_width=True
+        ):
 
-        marks = st.selectbox(
-            "Marks per Question",
-            [
-                1,
-                2,
-                5,
-                10,
-                15
-            ]
-        )
+            if not practice_topic.strip():
+                st.warning("Please enter a topic.")
+            else:
 
-    with col3:
-
-        question_type = st.selectbox(
-            "Question Type",
-            [
-                "Short Answer",
-                "Long Answer",
-                "Very Long Answer",
-                "Viva Questions"
-            ]
-        )
-
-    if st.button(
-        "❓ Generate Questions",
-        key="generate_questions",
-        use_container_width=True
-    ):
-
-        if not q_topics.strip():
-
-            st.warning("Please enter topics.")
-
-        else:
-
-            prompt = f"""
-You are an expert university question-paper designer.
-
-Generate {number_questions} questions.
+                prompt = f"""
+Generate {practice_count} multiple-choice practice questions.
 
 Subject:
-{q_subject}
+{practice_subject}
 
-Topics:
-{q_topics}
+Topic:
+{practice_topic}
 
-Question type:
-{question_type}
-
-Marks per question:
-{marks}
+Education Level:
+{education_level}
 
 Difficulty:
 {difficulty}
-
-Education level:
-{education_level}
 
 Language:
 {response_language}
 
-Requirements:
+Return ONLY valid JSON in this exact structure:
 
-1. Questions must be related to the provided topics.
-2. Avoid duplicate questions.
-3. Match the selected difficulty.
-4. Questions should be academically meaningful.
-5. Include a mixture of conceptual and application-based
-   questions where appropriate.
-6. Number every question.
+[
+  {{
+    "question": "Question text",
+    "options": [
+      "Option A",
+      "Option B",
+      "Option C",
+      "Option D"
+    ],
+    "answer": 0,
+    "explanation": "Short explanation"
+  }}
+]
+
+Rules:
+- answer is the zero-based index of the correct option.
+- Exactly four options per question.
+- Exactly one correct answer.
+- No duplicate questions.
+- Questions should test understanding.
 """
 
-            with st.spinner("Generating questions..."):
+                with st.spinner("Creating practice MCQs..."):
 
-                questions = ask_gemini(prompt)
+                    raw = ask_gemini(prompt)
 
-            st.session_state.questions_response = questions
+                    try:
+                        import json
 
-    if st.session_state.questions_response:
+                        cleaned = raw.strip()
 
-        st.subheader("📝 Generated Questions")
+                        if cleaned.startswith("```"):
+                            cleaned = cleaned.replace("```json", "", 1)
+                            cleaned = cleaned.replace("```", "", 1).strip()
 
-        st.markdown(st.session_state.questions_response)
+                        parsed = json.loads(cleaned)
 
-        if is_gemini_error(st.session_state.questions_response):
-            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
-        else:
-            render_pdf_download_button(
-                st.session_state.questions_response,
-                title=f"Question Paper — {q_subject or 'Exam'}",
-                filename="question_paper.pdf",
-                key="pdf_download_questions",
-            )
+                        if isinstance(parsed, list):
+                            st.session_state.quiz_questions = parsed
+                            st.session_state.quiz_answers = {}
+                            st.session_state.quiz_score = None
+                        else:
+                            st.error("Gemini returned an unexpected MCQ format.")
 
+                    except Exception:
+                        st.error(
+                            "Could not parse the MCQs automatically. "
+                            "Please generate them again."
+                        )
+                        st.code(raw)
 
-# ============================================================
-# TAB 4 — MCQ GENERATOR
-# ============================================================
+        if st.session_state.quiz_questions:
 
-with tab4:
+            st.subheader("📝 Practice")
 
-    st.header("📝 AI MCQ Generator")
+            for index, item in enumerate(
+                st.session_state.quiz_questions
+            ):
 
-    mcq_subject = st.text_input(
-        "Subject",
-        key="mcq_subject"
-    )
+                question_text = item.get(
+                    "question",
+                    f"Question {index + 1}"
+                )
 
-    mcq_topic = st.text_input(
-        "Topic",
-        key="mcq_topic"
-    )
+                options = item.get("options", [])
 
-    number_mcqs = st.number_input(
-        "Number of MCQs",
-        min_value=1,
-        max_value=50,
-        value=10
-    )
+                if len(options) != 4:
+                    continue
 
-    show_answers = st.checkbox(
-        "Show Answers",
-        value=True
-    )
+                answer = st.radio(
+                    f"{index + 1}. {question_text}",
+                    options,
+                    key=f"practice_answer_{index}"
+                )
 
-    if st.button(
-        "🧠 Generate MCQs",
-        key="generate_mcqs",
-        use_container_width=True
-    ):
+                st.session_state.quiz_answers[index] = answer
 
-        if not mcq_topic.strip():
+                if st.checkbox(
+                    "Show explanation",
+                    key=f"show_practice_explanation_{index}"
+                ):
+                    st.info(
+                        item.get("explanation", "No explanation provided.")
+                    )
 
-            st.warning("Please enter a topic.")
+    # --------------------------------------------------------
+    # STUDENT — TAKE QUIZ
+    # --------------------------------------------------------
 
-        else:
+    with student_tabs[4]:
 
-            answer_instruction = (
-                "Include the correct answer and explanation."
-                if show_answers
-                else
-                "Do not reveal the answers."
-            )
+        st.header("🎯 Take a Quiz")
 
-            prompt = f"""
-You are an expert educational assessment assistant.
+        quiz_subject = st.text_input(
+            "Subject",
+            key="quiz_subject",
+            placeholder="Example: Data Structures"
+        )
 
-Generate {number_mcqs} multiple-choice questions.
+        quiz_topic = st.text_input(
+            "Topic",
+            key="quiz_topic",
+            placeholder="Example: Binary Trees"
+        )
+
+        quiz_count = st.number_input(
+            "Number of Questions",
+            min_value=1,
+            max_value=15,
+            value=5,
+            key="quiz_count"
+        )
+
+        quiz_time = st.selectbox(
+            "Quiz Difficulty",
+            ["Easy", "Medium", "Hard", "Mixed"],
+            key="quiz_difficulty"
+        )
+
+        if st.button(
+            "🎯 Start New Quiz",
+            key="start_new_quiz",
+            use_container_width=True
+        ):
+
+            if not quiz_topic.strip():
+                st.warning("Please enter a quiz topic.")
+            else:
+
+                prompt = f"""
+Create {quiz_count} quiz questions for a student.
 
 Subject:
-{mcq_subject}
+{quiz_subject}
 
 Topic:
-{mcq_topic}
+{quiz_topic}
 
 Difficulty:
-{difficulty}
+{quiz_time}
 
 Education Level:
 {education_level}
@@ -968,121 +1999,222 @@ Education Level:
 Language:
 {response_language}
 
-Each question must contain:
+Return ONLY valid JSON:
 
-Question
-A. Option
-B. Option
-C. Option
-D. Option
+[
+  {{
+    "question": "Question",
+    "options": ["A", "B", "C", "D"],
+    "answer": 0,
+    "explanation": "Why this is correct"
+  }}
+]
 
-{answer_instruction}
-
-Make sure:
-
-- There is exactly one best answer.
-- Questions are factually correct.
-- Do not repeat questions.
-- Questions should test understanding rather than only memorization.
+Rules:
+- answer must be the zero-based correct option index.
+- Exactly four options.
+- Exactly one correct answer.
+- No duplicate questions.
 """
 
-            with st.spinner("Generating MCQs..."):
+                with st.spinner("Building your quiz..."):
 
-                mcqs = ask_gemini(prompt)
+                    raw = ask_gemini(prompt)
 
-            st.session_state.mcqs_response = mcqs
+                    try:
+                        import json
 
-    if st.session_state.mcqs_response:
+                        cleaned = raw.strip()
 
-        st.subheader("🧠 Generated MCQs")
+                        if cleaned.startswith("```"):
+                            cleaned = cleaned.replace("```json", "", 1)
+                            cleaned = cleaned.replace("```", "", 1).strip()
 
-        st.markdown(st.session_state.mcqs_response)
+                        parsed = json.loads(cleaned)
 
-        if is_gemini_error(st.session_state.mcqs_response):
-            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
-        else:
-            render_pdf_download_button(
-                st.session_state.mcqs_response,
-                title=f"MCQs — {mcq_topic or 'Quiz'}",
-                filename="mcqs.pdf",
-                key="pdf_download_mcqs",
-            )
+                        if isinstance(parsed, list) and parsed:
 
+                            st.session_state.quiz_questions = parsed
+                            st.session_state.quiz_answers = {}
+                            st.session_state.quiz_score = None
 
-# ============================================================
-# TAB 5 — PDF ASSISTANT
-# ============================================================
+                            st.rerun()
 
-with tab5:
+                        else:
+                            st.error("Invalid quiz format returned by Gemini.")
 
-    st.header("📄 Ask Questions From Your PDF")
+                    except Exception:
+                        st.error(
+                            "Could not create the interactive quiz. "
+                            "Please try again."
+                        )
+                        st.code(raw)
 
-    uploaded_pdf = st.file_uploader(
-        "Upload a study material PDF",
-        type=["pdf"]
-    )
+        if st.session_state.quiz_questions:
 
-    if uploaded_pdf:
+            st.markdown("### 🎯 Answer all questions")
 
-        if st.button(
-            "📖 Read PDF",
-            use_container_width=True
-        ):
+            for index, item in enumerate(
+                st.session_state.quiz_questions
+            ):
 
-            with st.spinner("Reading PDF..."):
+                options = item.get("options", [])
 
-                pdf_text = extract_pdf_text(
-                    uploaded_pdf
+                if len(options) != 4:
+                    continue
+
+                selected = st.radio(
+                    f"{index + 1}. {item.get('question', '')}",
+                    options,
+                    key=f"quiz_answer_{index}"
                 )
 
-            st.session_state.pdf_text = pdf_text
+                st.session_state.quiz_answers[index] = selected
 
-            if pdf_text.strip():
+            if st.button(
+                "✅ Submit Quiz",
+                key="submit_quiz",
+                use_container_width=True
+            ):
+
+                score = 0
+
+                for index, item in enumerate(
+                    st.session_state.quiz_questions
+                ):
+
+                    options = item.get("options", [])
+                    correct_index = item.get("answer")
+
+                    if (
+                        index in st.session_state.quiz_answers
+                        and isinstance(correct_index, int)
+                        and 0 <= correct_index < len(options)
+                    ):
+
+                        if (
+                            st.session_state.quiz_answers[index]
+                            == options[correct_index]
+                        ):
+                            score += 1
+
+                st.session_state.quiz_score = score
+
+            if st.session_state.quiz_score is not None:
+
+                total = len(st.session_state.quiz_questions)
+                score = st.session_state.quiz_score
+
+                percentage = round(
+                    (score / total) * 100,
+                    1
+                ) if total else 0
 
                 st.success(
-                    "PDF successfully processed."
+                    f"🎉 Your Score: {score}/{total} "
+                    f"({percentage}%)"
                 )
 
-                st.info(
-                    f"Extracted approximately "
-                    f"{len(pdf_text)} characters."
-                )
+                for index, item in enumerate(
+                    st.session_state.quiz_questions
+                ):
 
-            else:
+                    options = item.get("options", [])
+                    correct_index = item.get("answer")
 
-                st.error(
-                    "Could not extract text from this PDF."
-                )
+                    if (
+                        isinstance(correct_index, int)
+                        and 0 <= correct_index < len(options)
+                    ):
 
-    if st.session_state.pdf_text:
+                        correct_option = options[correct_index]
 
-        pdf_question = st.text_area(
-            "Ask something about the uploaded material",
-            placeholder=(
-                "Example: Explain the main concepts "
-                "covered in Unit 1."
-            ),
-            height=130
+                        if (
+                            st.session_state.quiz_answers.get(index)
+                            == correct_option
+                        ):
+                            st.success(
+                                f"Q{index + 1}: Correct"
+                            )
+                        else:
+                            st.error(
+                                f"Q{index + 1}: Incorrect. "
+                                f"Correct answer: {correct_option}"
+                            )
+
+                        st.caption(
+                            item.get(
+                                "explanation",
+                                "No explanation provided."
+                            )
+                        )
+
+    # --------------------------------------------------------
+    # STUDENT — PDF ASSISTANT
+    # --------------------------------------------------------
+
+    with student_tabs[5]:
+
+        st.header("📄 Ask Questions From Your PDF")
+
+        uploaded_pdf = st.file_uploader(
+            "Upload a study material PDF",
+            type=["pdf"],
+            key="student_pdf_upload"
         )
 
-        if st.button(
-            "🤖 Ask About PDF",
-            use_container_width=True
-        ):
+        if uploaded_pdf:
 
-            if not pdf_question.strip():
+            if st.button(
+                "📖 Read PDF",
+                key="student_read_pdf",
+                use_container_width=True
+            ):
 
-                st.warning(
-                    "Please enter a question."
-                )
+                with st.spinner("Reading PDF..."):
 
-            else:
+                    st.session_state.pdf_text = extract_pdf_text(
+                        uploaded_pdf
+                    )
 
-                # Limit the amount of text sent in one request.
-                material = st.session_state.pdf_text[:50000]
+                if st.session_state.pdf_text.strip():
 
-                prompt = f"""
-You are an AI Teaching Assistant.
+                    st.success("PDF successfully processed.")
+
+                    st.info(
+                        f"Extracted approximately "
+                        f"{len(st.session_state.pdf_text)} characters."
+                    )
+
+                else:
+                    st.error("Could not extract text from this PDF.")
+
+        if st.session_state.pdf_text:
+
+            pdf_question = st.text_area(
+                "Ask something about your study material",
+                placeholder=(
+                    "Example: Explain the main concepts "
+                    "covered in Unit 1."
+                ),
+                height=130,
+                key="student_pdf_question"
+            )
+
+            if st.button(
+                "🤖 Ask About PDF",
+                key="student_pdf_ask",
+                use_container_width=True
+            ):
+
+                if not pdf_question.strip():
+                    st.warning("Please enter a question.")
+                else:
+
+                    material = st.session_state.pdf_text[:50000]
+
+                    prompt = f"""
+You are an AI student tutor.
 
 Answer the student's question using the study
 material provided below.
@@ -1115,40 +2247,29 @@ Instructions:
 6. Use headings and bullet points where appropriate.
 """
 
-                with st.spinner(
-                    "Analyzing your study material..."
-                ):
+                    with st.spinner(
+                        "Analyzing your study material..."
+                    ):
+                        st.session_state.pdf_qa_response = ask_gemini(
+                            prompt
+                        )
 
-                    pdf_answer = ask_gemini(prompt)
-
-                st.session_state.pdf_qa_response = pdf_answer
-
-    if st.session_state.pdf_qa_response:
-
-        st.subheader(
-            "🤖 AI Answer"
+        show_generated_content(
+            "pdf_qa_response",
+            "🤖 AI Answer",
+            "Student PDF Assistant — Answer",
+            "student_pdf_answer.pdf",
+            "pdf_download_student_pdf",
         )
-
-        st.markdown(st.session_state.pdf_qa_response)
-
-        if is_gemini_error(st.session_state.pdf_qa_response):
-            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
-        else:
-            render_pdf_download_button(
-                st.session_state.pdf_qa_response,
-                title="PDF Assistant — Answer",
-                filename="pdf_assistant_answer.pdf",
-                key="pdf_download_pdf_qa",
-            )
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.divider()
+st.markdown("---")
 
 st.caption(
-    "🎓 AI Teaching Assistant | "
-    "Powered by Python, Streamlit and Gemini"
+    "🎓 AI Teaching Assistant | Teacher Mode + Student Mode | "
+    "Powered by Gemini + Streamlit"
 )
