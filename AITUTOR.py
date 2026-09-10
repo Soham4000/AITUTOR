@@ -1,6 +1,10 @@
+import io
+import os
+
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
+from fpdf import FPDF
 
 
 # ============================================================
@@ -97,7 +101,7 @@ def ask_gemini(prompt):
 
 
 # ============================================================
-# PDF TEXT EXTRACTION
+# PDF TEXT EXTRACTION (for the PDF Assistant tab — reading a PDF IN)
 # ============================================================
 
 def extract_pdf_text(uploaded_file):
@@ -123,14 +127,180 @@ def extract_pdf_text(uploaded_file):
 
 
 # ============================================================
+# PDF EXPORT (for turning generated answers INTO a downloadable PDF)
+# ============================================================
+
+# Optional Unicode fonts. If you want proper Hindi / Bengali rendering in the
+# exported PDFs (not just on screen), download these free Google Noto fonts
+# and place them in a "fonts/" folder next to this script:
+#
+#   fonts/NotoSans-Regular.ttf        (Latin / English)
+#   fonts/NotoSans-Bold.ttf
+#   fonts/NotoSansDevanagari-Regular.ttf   (Hindi)
+#   fonts/NotoSansBengali-Regular.ttf      (Bengali)
+#
+# Without these files, PDF export still works, but non-Latin characters
+# (Hindi/Bengali) will be replaced with "?" in the exported PDF, since the
+# built-in PDF core fonts only support Latin-1 text. The on-screen
+# st.markdown() output is NOT affected — this limitation is PDF-only.
+
+FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
+
+_UNICODE_FONT_CANDIDATES = [
+    ("NotoSansDevanagari", "NotoSansDevanagari-Regular.ttf"),
+    ("NotoSansBengali", "NotoSansBengali-Regular.ttf"),
+    ("NotoSans", "NotoSans-Regular.ttf"),
+]
+
+
+def _register_unicode_fonts(pdf: FPDF):
+    """
+    Try to register any bundled Unicode TTF fonts. Returns the name of the
+    'body' font to use, and whether any Unicode font was actually found.
+    """
+
+    registered_any = False
+    body_font_name = "Helvetica"  # fpdf2 core font fallback (Latin-1 only)
+
+    for font_name, filename in _UNICODE_FONT_CANDIDATES:
+
+        font_path = os.path.join(FONTS_DIR, filename)
+
+        if os.path.exists(font_path):
+
+            try:
+                pdf.add_font(font_name, "", font_path)
+                registered_any = True
+                body_font_name = font_name
+
+            except Exception:
+                pass
+
+    return body_font_name, registered_any
+
+
+def _safe_text(text: str, unicode_ok: bool) -> str:
+    """
+    If we don't have a Unicode font loaded, strip characters the core PDF
+    fonts can't render so fpdf2 doesn't crash on Hindi/Bengali text.
+    """
+
+    if unicode_ok:
+        return text
+
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def generate_pdf_bytes(content: str, title: str) -> bytes:
+    """
+    Converts a markdown-ish text response (from Gemini) into a simple,
+    readably-formatted PDF. Handles #/##/### headings and -/* bullet points;
+    everything else is treated as a normal paragraph.
+    """
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    body_font, unicode_ok = _register_unicode_fonts(pdf)
+
+    heading_font = body_font if unicode_ok else "Helvetica"
+
+    # Title
+    pdf.set_font(heading_font, size=16)
+    pdf.multi_cell(0, 10, _safe_text(title, unicode_ok))
+    pdf.ln(2)
+
+    pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
+
+    for raw_line in content.split("\n"):
+
+        line = raw_line.strip()
+
+        if not line:
+            pdf.ln(3)
+            continue
+
+        if line.startswith("### "):
+            pdf.set_font(heading_font, size=13)
+            pdf.multi_cell(0, 8, _safe_text(line[4:], unicode_ok))
+            pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
+
+        elif line.startswith("## "):
+            pdf.set_font(heading_font, size=14)
+            pdf.multi_cell(0, 9, _safe_text(line[3:], unicode_ok))
+            pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
+
+        elif line.startswith("# "):
+            pdf.set_font(heading_font, size=16)
+            pdf.multi_cell(0, 10, _safe_text(line[2:], unicode_ok))
+            pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
+
+        elif line.startswith(("- ", "* ")):
+            bullet_text = "  •  " + line[2:].replace("**", "")
+            pdf.multi_cell(0, 7, _safe_text(bullet_text, unicode_ok))
+
+        else:
+            clean = line.replace("**", "").replace("__", "")
+            pdf.multi_cell(0, 7, _safe_text(clean, unicode_ok))
+
+    output = pdf.output(dest="S")
+
+    # fpdf2 versions differ on str vs bytearray return type
+    if isinstance(output, (bytes, bytearray)):
+        return bytes(output)
+
+    return output.encode("latin-1")
+
+
+def render_pdf_download_button(content: str, title: str, filename: str, key: str):
+    """
+    Renders a 'Download as PDF' button for a piece of generated content.
+    Call this right after st.markdown(content) in any tab.
+    """
+
+    if not content or not content.strip():
+        return
+
+    try:
+        pdf_bytes = generate_pdf_bytes(content, title)
+
+    except Exception as e:
+        st.warning(f"Could not prepare PDF for download: {e}")
+        return
+
+    st.download_button(
+        label="📄 Download as PDF",
+        data=pdf_bytes,
+        file_name=filename,
+        mime="application/pdf",
+        key=key,
+        use_container_width=True,
+    )
+
+    if not os.path.isdir(FONTS_DIR) or not os.listdir(FONTS_DIR):
+        st.caption(
+            "ℹ️ Add Unicode fonts to a `fonts/` folder for proper "
+            "Hindi/Bengali PDF export — see comments in app.py."
+        )
+
+
+# ============================================================
 # SESSION STATE
 # ============================================================
 
-if "pdf_text" not in st.session_state:
-    st.session_state.pdf_text = ""
+_DEFAULT_STATE = {
+    "pdf_text": "",
+    "teacher_response": "",
+    "notes_response": "",
+    "questions_response": "",
+    "mcqs_response": "",
+    "pdf_qa_response": "",
+}
 
-if "last_response" not in st.session_state:
-    st.session_state.last_response = ""
+for _key, _default in _DEFAULT_STATE.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
 
 
 # ============================================================
@@ -292,11 +462,20 @@ Instructions:
 
                 answer = ask_gemini(prompt)
 
-            st.session_state.last_response = answer
+            st.session_state.teacher_response = answer
 
-            st.subheader("🤖 AI Teacher Response")
+    if st.session_state.teacher_response:
 
-            st.markdown(answer)
+        st.subheader("🤖 AI Teacher Response")
+
+        st.markdown(st.session_state.teacher_response)
+
+        render_pdf_download_button(
+            st.session_state.teacher_response,
+            title=f"AI Teacher — {subject or 'Response'}",
+            filename="ai_teacher_response.pdf",
+            key="pdf_download_teacher",
+        )
 
 
 # ============================================================
@@ -380,9 +559,20 @@ Format the answer using clear headings and bullet points.
 
                 notes = ask_gemini(prompt)
 
-            st.subheader("📖 Generated Notes")
+            st.session_state.notes_response = notes
 
-            st.markdown(notes)
+    if st.session_state.notes_response:
+
+        st.subheader("📖 Generated Notes")
+
+        st.markdown(st.session_state.notes_response)
+
+        render_pdf_download_button(
+            st.session_state.notes_response,
+            title=f"Notes — {notes_topic or 'Study Notes'}",
+            filename="study_notes.pdf",
+            key="pdf_download_notes",
+        )
 
 
 # ============================================================
@@ -496,9 +686,20 @@ Requirements:
 
                 questions = ask_gemini(prompt)
 
-            st.subheader("📝 Generated Questions")
+            st.session_state.questions_response = questions
 
-            st.markdown(questions)
+    if st.session_state.questions_response:
+
+        st.subheader("📝 Generated Questions")
+
+        st.markdown(st.session_state.questions_response)
+
+        render_pdf_download_button(
+            st.session_state.questions_response,
+            title=f"Question Paper — {q_subject or 'Exam'}",
+            filename="question_paper.pdf",
+            key="pdf_download_questions",
+        )
 
 
 # ============================================================
@@ -592,9 +793,20 @@ Make sure:
 
                 mcqs = ask_gemini(prompt)
 
-            st.subheader("🧠 Generated MCQs")
+            st.session_state.mcqs_response = mcqs
 
-            st.markdown(mcqs)
+    if st.session_state.mcqs_response:
+
+        st.subheader("🧠 Generated MCQs")
+
+        st.markdown(st.session_state.mcqs_response)
+
+        render_pdf_download_button(
+            st.session_state.mcqs_response,
+            title=f"MCQs — {mcq_topic or 'Quiz'}",
+            filename="mcqs.pdf",
+            key="pdf_download_mcqs",
+        )
 
 
 # ============================================================
@@ -709,11 +921,22 @@ Instructions:
 
                     pdf_answer = ask_gemini(prompt)
 
-                st.subheader(
-                    "🤖 AI Answer"
-                )
+                st.session_state.pdf_qa_response = pdf_answer
 
-                st.markdown(pdf_answer)
+    if st.session_state.pdf_qa_response:
+
+        st.subheader(
+            "🤖 AI Answer"
+        )
+
+        st.markdown(st.session_state.pdf_qa_response)
+
+        render_pdf_download_button(
+            st.session_state.pdf_qa_response,
+            title="PDF Assistant — Answer",
+            filename="pdf_assistant_answer.pdf",
+            key="pdf_download_pdf_qa",
+        )
 
 
 # ============================================================
