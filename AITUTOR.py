@@ -100,6 +100,23 @@ def ask_gemini(prompt):
         return f"Gemini API Error: {str(e)}"
 
 
+def is_gemini_error(response_text: str) -> bool:
+    """
+    True if ask_gemini() returned an error/placeholder string rather than
+    real generated content. Used to skip offering a PDF download for
+    something that isn't actually study material.
+    """
+
+    if not response_text:
+        return True
+
+    return response_text.startswith((
+        "Gemini API Error:",
+        "Gemini model is not configured.",
+        "Gemini did not return a response.",
+    ))
+
+
 # ============================================================
 # PDF TEXT EXTRACTION (for the PDF Assistant tab — reading a PDF IN)
 # ============================================================
@@ -641,12 +658,15 @@ Instructions:
 
         st.markdown(st.session_state.teacher_response)
 
-        render_pdf_download_button(
-            st.session_state.teacher_response,
-            title=f"AI Teacher — {subject or 'Response'}",
-            filename="ai_teacher_response.pdf",
-            key="pdf_download_teacher",
-        )
+        if is_gemini_error(st.session_state.teacher_response):
+            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        else:
+            render_pdf_download_button(
+                st.session_state.teacher_response,
+                title=f"AI Teacher — {subject or 'Response'}",
+                filename="ai_teacher_response.pdf",
+                key="pdf_download_teacher",
+            )
 
 
 # ============================================================
@@ -738,12 +758,15 @@ Format the answer using clear headings and bullet points.
 
         st.markdown(st.session_state.notes_response)
 
-        render_pdf_download_button(
-            st.session_state.notes_response,
-            title=f"Notes — {notes_topic or 'Study Notes'}",
-            filename="study_notes.pdf",
-            key="pdf_download_notes",
-        )
+        if is_gemini_error(st.session_state.notes_response):
+            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        else:
+            render_pdf_download_button(
+                st.session_state.notes_response,
+                title=f"Notes — {notes_topic or 'Study Notes'}",
+                filename="study_notes.pdf",
+                key="pdf_download_notes",
+            )
 
 
 # ============================================================
@@ -865,12 +888,15 @@ Requirements:
 
         st.markdown(st.session_state.questions_response)
 
-        render_pdf_download_button(
-            st.session_state.questions_response,
-            title=f"Question Paper — {q_subject or 'Exam'}",
-            filename="question_paper.pdf",
-            key="pdf_download_questions",
-        )
+        if is_gemini_error(st.session_state.questions_response):
+            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        else:
+            render_pdf_download_button(
+                st.session_state.questions_response,
+                title=f"Question Paper — {q_subject or 'Exam'}",
+                filename="question_paper.pdf",
+                key="pdf_download_questions",
+            )
 
 
 # ============================================================
@@ -972,12 +998,15 @@ Make sure:
 
         st.markdown(st.session_state.mcqs_response)
 
-        render_pdf_download_button(
-            st.session_state.mcqs_response,
-            title=f"MCQs — {mcq_topic or 'Quiz'}",
-            filename="mcqs.pdf",
-            key="pdf_download_mcqs",
-        )
+        if is_gemini_error(st.session_state.mcqs_response):
+            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        else:
+            render_pdf_download_button(
+                st.session_state.mcqs_response,
+                title=f"MCQs — {mcq_topic or 'Quiz'}",
+                filename="mcqs.pdf",
+                key="pdf_download_mcqs",
+            )
 
 
 # ============================================================
@@ -1102,12 +1131,15 @@ Instructions:
 
         st.markdown(st.session_state.pdf_qa_response)
 
-        render_pdf_download_button(
-            st.session_state.pdf_qa_response,
-            title="PDF Assistant — Answer",
-            filename="pdf_assistant_answer.pdf",
-            key="pdf_download_pdf_qa",
-        )
+        if is_gemini_error(st.session_state.pdf_qa_response):
+            st.caption("⚠️ This looks like an API error, not generated content — no PDF export offered.")
+        else:
+            render_pdf_download_button(
+                st.session_state.pdf_qa_response,
+                title="PDF Assistant — Answer",
+                filename="pdf_assistant_answer.pdf",
+                key="pdf_download_pdf_qa",
+            )
 
 
 # ============================================================
