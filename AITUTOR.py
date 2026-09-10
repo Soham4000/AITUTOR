@@ -191,6 +191,83 @@ def _safe_text(text: str, unicode_ok: bool) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
+import re
+
+_RULE_LINE_RE = re.compile(r"^[\s\-_*=]{3,}$")          # e.g. "---", "___", "***"
+_TABLE_SEP_LINE_RE = re.compile(r"^[\s|:\-]{3,}$")       # e.g. "|---|:---:|---|"
+_LONG_TOKEN_RE = re.compile(r"\S{40,}")                  # unbroken 40+ char tokens
+
+
+def _break_long_tokens(text: str, chunk_size: int = 30) -> str:
+    """
+    Inserts spaces into any unbroken run of 40+ non-space characters
+    (long URLs, hashes, run-on punctuation) so the PDF renderer always
+    has a place to wrap the line. Without this, a single long token can
+    make fpdf2 raise "Not enough horizontal space to render a single
+    character" instead of wrapping.
+    """
+
+    def _splitter(match: "re.Match") -> str:
+        token = match.group(0)
+        return " ".join(
+            token[i:i + chunk_size] for i in range(0, len(token), chunk_size)
+        )
+
+    return _LONG_TOKEN_RE.sub(_splitter, text)
+
+
+def _sanitize_markdown_for_pdf(content: str) -> str:
+    """
+    Strips Markdown constructs that commonly break PDF text wrapping:
+    table separator rows (|---|---|), horizontal rules (---, ***), and
+    table pipes. Also breaks up any remaining long unbroken tokens.
+    Keeps everything else as-is; headings/bullets are handled separately
+    in generate_pdf_bytes.
+    """
+
+    cleaned_lines = []
+
+    for line in content.split("\n"):
+
+        stripped = line.strip()
+
+        # Drop markdown table separator rows entirely (they carry no content).
+        if _TABLE_SEP_LINE_RE.match(stripped) and "-" in stripped:
+            continue
+
+        # Collapse pure horizontal-rule lines to a blank line.
+        if _RULE_LINE_RE.match(stripped):
+            cleaned_lines.append("")
+            continue
+
+        # Turn "| a | b | c |" into "a  |  b  |  c" so pipes don't glue
+        # to neighboring words, and keep it wrappable.
+        if stripped.startswith("|") and stripped.endswith("|"):
+            stripped = stripped.strip("|")
+            stripped = " | ".join(
+                part.strip() for part in stripped.split("|")
+            )
+
+        cleaned_lines.append(_break_long_tokens(stripped))
+
+    return "\n".join(cleaned_lines)
+
+
+def _write_cell(pdf: FPDF, text: str, line_height: int):
+    """
+    multi_cell wrapper that also tries wrapmode='CHAR' as a last-resort
+    fallback so a stray long token can never crash PDF generation, even
+    if _sanitize_markdown_for_pdf missed something. Some older fpdf2
+    versions don't accept wrapmode, so we fall back gracefully.
+    """
+
+    try:
+        pdf.multi_cell(0, line_height, text, wrapmode="CHAR")
+    except TypeError:
+        # Installed fpdf2 version doesn't support wrapmode.
+        pdf.multi_cell(0, line_height, text)
+
+
 def generate_pdf_bytes(content: str, title: str) -> bytes:
     """
     Converts a markdown-ish text response (from Gemini) into a simple,
@@ -208,10 +285,12 @@ def generate_pdf_bytes(content: str, title: str) -> bytes:
 
     # Title
     pdf.set_font(heading_font, size=16)
-    pdf.multi_cell(0, 10, _safe_text(title, unicode_ok))
+    _write_cell(pdf, _safe_text(_break_long_tokens(title), unicode_ok), 10)
     pdf.ln(2)
 
     pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
+
+    content = _sanitize_markdown_for_pdf(content)
 
     for raw_line in content.split("\n"):
 
@@ -223,26 +302,26 @@ def generate_pdf_bytes(content: str, title: str) -> bytes:
 
         if line.startswith("### "):
             pdf.set_font(heading_font, size=13)
-            pdf.multi_cell(0, 8, _safe_text(line[4:], unicode_ok))
+            _write_cell(pdf, _safe_text(line[4:], unicode_ok), 8)
             pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
 
         elif line.startswith("## "):
             pdf.set_font(heading_font, size=14)
-            pdf.multi_cell(0, 9, _safe_text(line[3:], unicode_ok))
+            _write_cell(pdf, _safe_text(line[3:], unicode_ok), 9)
             pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
 
         elif line.startswith("# "):
             pdf.set_font(heading_font, size=16)
-            pdf.multi_cell(0, 10, _safe_text(line[2:], unicode_ok))
+            _write_cell(pdf, _safe_text(line[2:], unicode_ok), 10)
             pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
 
         elif line.startswith(("- ", "* ")):
             bullet_text = "  •  " + line[2:].replace("**", "")
-            pdf.multi_cell(0, 7, _safe_text(bullet_text, unicode_ok))
+            _write_cell(pdf, _safe_text(bullet_text, unicode_ok), 7)
 
         else:
             clean = line.replace("**", "").replace("__", "")
-            pdf.multi_cell(0, 7, _safe_text(clean, unicode_ok))
+            _write_cell(pdf, _safe_text(clean, unicode_ok), 7)
 
     output = pdf.output(dest="S")
 
