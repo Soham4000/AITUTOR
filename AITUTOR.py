@@ -69,7 +69,7 @@ def configure_gemini():
     genai.configure(api_key=api_key)
 
     model = genai.GenerativeModel(
-        "gemini-3.7-flash"
+        "gemini-3.5-flash"
     )
 
     return model
