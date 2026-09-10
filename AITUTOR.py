@@ -195,34 +195,15 @@ import re
 
 _RULE_LINE_RE = re.compile(r"^[\s\-_*=]{3,}$")          # e.g. "---", "___", "***"
 _TABLE_SEP_LINE_RE = re.compile(r"^[\s|:\-]{3,}$")       # e.g. "|---|:---:|---|"
-_LONG_TOKEN_RE = re.compile(r"\S{40,}")                  # unbroken 40+ char tokens
-
-
-def _break_long_tokens(text: str, chunk_size: int = 30) -> str:
-    """
-    Inserts spaces into any unbroken run of 40+ non-space characters
-    (long URLs, hashes, run-on punctuation) so the PDF renderer always
-    has a place to wrap the line. Without this, a single long token can
-    make fpdf2 raise "Not enough horizontal space to render a single
-    character" instead of wrapping.
-    """
-
-    def _splitter(match: "re.Match") -> str:
-        token = match.group(0)
-        return " ".join(
-            token[i:i + chunk_size] for i in range(0, len(token), chunk_size)
-        )
-
-    return _LONG_TOKEN_RE.sub(_splitter, text)
 
 
 def _sanitize_markdown_for_pdf(content: str) -> str:
     """
-    Strips Markdown constructs that commonly break PDF text wrapping:
+    Strips Markdown constructs that add visual noise to a PDF export:
     table separator rows (|---|---|), horizontal rules (---, ***), and
-    table pipes. Also breaks up any remaining long unbroken tokens.
-    Keeps everything else as-is; headings/bullets are handled separately
-    in generate_pdf_bytes.
+    raw table pipes (turned into readable "a | b | c" text). Does NOT
+    need to worry about line length/wrapping — that's handled precisely
+    in _write_cell() below via actual font-width measurement.
     """
 
     cleaned_lines = []
@@ -240,32 +221,93 @@ def _sanitize_markdown_for_pdf(content: str) -> str:
             cleaned_lines.append("")
             continue
 
-        # Turn "| a | b | c |" into "a  |  b  |  c" so pipes don't glue
-        # to neighboring words, and keep it wrappable.
+        # Turn "| a | b | c |" into "a | b | c" so pipes don't glue
+        # to neighboring words.
         if stripped.startswith("|") and stripped.endswith("|"):
             stripped = stripped.strip("|")
             stripped = " | ".join(
                 part.strip() for part in stripped.split("|")
             )
 
-        cleaned_lines.append(_break_long_tokens(stripped))
+        cleaned_lines.append(stripped)
 
     return "\n".join(cleaned_lines)
 
 
-def _write_cell(pdf: FPDF, text: str, line_height: int):
+def _wrap_by_measured_width(pdf: FPDF, text: str, max_width: float) -> list:
     """
-    multi_cell wrapper that also tries wrapmode='CHAR' as a last-resort
-    fallback so a stray long token can never crash PDF generation, even
-    if _sanitize_markdown_for_pdf missed something. Some older fpdf2
-    versions don't accept wrapmode, so we fall back gracefully.
+    Wraps `text` into lines that are each verified, via fpdf2's own
+    get_string_width() for the CURRENTLY ACTIVE font, to fit within
+    max_width. This deliberately bypasses fpdf2's internal multi_cell
+    word-wrap algorithm, which has known edge cases — including on
+    long unbroken tokens (URLs, hashes, table artifacts) and, on some
+    fpdf2 versions, even on wrapmode='CHAR' itself — that raise
+    "Not enough horizontal space to render a single character" instead
+    of wrapping. By only ever handing multi_cell a string that already
+    fits on one line, that whole class of error is avoided regardless
+    of which fpdf2 version is installed.
     """
 
-    try:
-        pdf.multi_cell(0, line_height, text, wrapmode="CHAR")
-    except TypeError:
-        # Installed fpdf2 version doesn't support wrapmode.
-        pdf.multi_cell(0, line_height, text)
+    if not text:
+        return [""]
+
+    words = text.split(" ")
+    lines = []
+    current = ""
+
+    def fits(candidate: str) -> bool:
+        return pdf.get_string_width(candidate) <= max_width
+
+    for word in words:
+
+        # A single "word" wider than the whole line (long URL, hash,
+        # run-on punctuation) gets sliced into pieces that each fit,
+        # via binary search on the measured width.
+        while word and not fits(word):
+
+            lo, hi, fit_len = 1, len(word), 1
+
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fits(word[:mid]):
+                    fit_len = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            piece, word = word[:fit_len], word[fit_len:]
+
+            if current:
+                lines.append(current)
+                current = ""
+
+            lines.append(piece)
+
+        candidate = f"{current} {word}".strip() if current else word
+
+        if fits(candidate):
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines or [""]
+
+
+def _write_cell(pdf: FPDF, text: str, line_height: int):
+    """
+    Renders `text`, pre-wrapped to fit the page width for the currently
+    active font, one guaranteed-to-fit line per multi_cell call.
+    """
+
+    max_width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    for line in _wrap_by_measured_width(pdf, text, max_width):
+        pdf.multi_cell(0, line_height, line)
 
 
 def generate_pdf_bytes(content: str, title: str) -> bytes:
@@ -285,7 +327,7 @@ def generate_pdf_bytes(content: str, title: str) -> bytes:
 
     # Title
     pdf.set_font(heading_font, size=16)
-    _write_cell(pdf, _safe_text(_break_long_tokens(title), unicode_ok), 10)
+    _write_cell(pdf, _safe_text(title, unicode_ok), 10)
     pdf.ln(2)
 
     pdf.set_font(body_font if unicode_ok else "Helvetica", size=12)
