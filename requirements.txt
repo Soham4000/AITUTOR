@@ -3,4 +3,3 @@ google-generativeai
 pypdf
 fpdf2
 pandas
-youtube-transcript-api
