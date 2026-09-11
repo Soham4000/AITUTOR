@@ -1,11 +1,20 @@
 import io
 import os
+import re
+import tempfile
+import time
 
 import pandas as pd
 import streamlit as st
 import google.generativeai as genai
 from pypdf import PdfReader
 from fpdf import FPDF
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    YOUTUBE_TRANSCRIPT_AVAILABLE = True
+except ImportError:
+    YOUTUBE_TRANSCRIPT_AVAILABLE = False
 
 
 # ============================================================
@@ -68,8 +77,12 @@ def configure_gemini():
 
     genai.configure(api_key=api_key)
 
+    # NOTE: this must be a model that supports video input for the
+    # "Upload Video File" transcription path to work (gemini-1.5/2.0/2.5
+    # flash and pro models all do). Check https://ai.google.dev/models
+    # for the current list if you change this.
     model = genai.GenerativeModel(
-        "gemini-3.5-flash"
+        "gemini-2.0-flash"
     )
 
     return model
@@ -145,6 +158,168 @@ def extract_pdf_text(uploaded_file):
 
 
 # ============================================================
+# VIDEO LECTURE HELPERS
+# ============================================================
+#
+# Two ways a video lecture gets turned into text the model can reason
+# over:
+#   1. YouTube link  -> youtube-transcript-api pulls the real captions.
+#   2. Uploaded file  -> the file is sent to Gemini's File API and the
+#      model itself is asked to produce a timestamped transcript.
+#
+# Either path produces the same shape of data: a list of "segments"
+# (each with a start time, text, and a short label for the section
+# picker UI) plus a flattened `full_text` version.
+
+_YOUTUBE_ID_RE = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/))([A-Za-z0-9_-]{11})"
+)
+
+
+def extract_youtube_video_id(url: str):
+    """Pulls the 11-character video ID out of a YouTube URL, or None."""
+
+    if not url:
+        return None
+
+    match = _YOUTUBE_ID_RE.search(url.strip())
+    return match.group(1) if match else None
+
+
+def _format_timestamp(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _build_full_text(segments):
+    return "\n".join(
+        f"[{_format_timestamp(seg['start'])}] {seg['text']}" for seg in segments
+    )
+
+
+def fetch_youtube_transcript(video_id: str):
+    """
+    Returns (segments, full_text, error) for a YouTube video, grouping
+    raw caption lines into ~45 second chunks so the section picker
+    shows meaningful pieces instead of every individual caption line.
+    """
+
+    if not YOUTUBE_TRANSCRIPT_AVAILABLE:
+        return [], "", (
+            "The `youtube-transcript-api` package is not installed. "
+            "Add it to requirements.txt to enable YouTube transcripts."
+        )
+
+    try:
+        raw = YouTubeTranscriptApi.get_transcript(video_id)
+
+    except Exception as e:
+        return [], "", f"Could not fetch transcript: {str(e)}"
+
+    chunk_seconds = 45
+    segments = []
+    current_start = None
+    current_text = []
+
+    for entry in raw:
+
+        start = entry["start"]
+
+        if current_start is None:
+            current_start = start
+
+        if start - current_start > chunk_seconds and current_text:
+            segments.append({"start": current_start, "text": " ".join(current_text).strip()})
+            current_start = start
+            current_text = []
+
+        current_text.append(entry["text"])
+
+    if current_text:
+        segments.append({"start": current_start, "text": " ".join(current_text).strip()})
+
+    for seg in segments:
+        preview = seg["text"][:60] + ("…" if len(seg["text"]) > 60 else "")
+        seg["label"] = f"[{_format_timestamp(seg['start'])}] {preview}"
+
+    return segments, _build_full_text(segments), None
+
+
+def upload_and_transcribe_video(uploaded_file):
+    """
+    Uploads a locally-uploaded video file to Gemini's File API and asks
+    the model to produce a timestamped transcript. Returns
+    (segments, full_text, error).
+    """
+
+    if model is None:
+        return [], "", "Gemini model is not configured."
+
+    tmp_path = None
+
+    try:
+        suffix = os.path.splitext(uploaded_file.name)[1] or ".mp4"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+
+        video_ref = genai.upload_file(path=tmp_path)
+
+        # Gemini needs a little time to finish processing video files.
+        while getattr(video_ref, "state", None) and video_ref.state.name == "PROCESSING":
+            time.sleep(2)
+            video_ref = genai.get_file(video_ref.name)
+
+        if getattr(video_ref, "state", None) and video_ref.state.name == "FAILED":
+            return [], "", "Gemini could not process this video file."
+
+        prompt = (
+            "Transcribe this lecture video. Break the transcript into "
+            "sections of roughly 30-60 seconds. Return ONLY plain text, "
+            "one section per line, each formatted exactly as:\n"
+            "[MM:SS] section text here\n"
+            "Do not add commentary, headings, or markdown."
+        )
+
+        response = model.generate_content([video_ref, prompt])
+        raw_text = response.text if response and response.text else ""
+
+        segments = []
+
+        for line in raw_text.strip().split("\n"):
+
+            m = re.match(r"^\[(\d{1,2}):(\d{2})\]\s*(.*)$", line.strip())
+
+            if not m:
+                continue
+
+            minutes, secs, text = m.groups()
+            start = int(minutes) * 60 + int(secs)
+            preview = text.strip()[:60] + ("…" if len(text.strip()) > 60 else "")
+
+            segments.append({
+                "start": start,
+                "text": text.strip(),
+                "label": f"[{_format_timestamp(start)}] {preview}",
+            })
+
+        full_text = _build_full_text(segments) if segments else raw_text
+
+        return segments, full_text, None
+
+    except Exception as e:
+        return [], "", f"Video transcription error: {str(e)}"
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+# ============================================================
 # PDF EXPORT (for turning generated answers INTO a downloadable PDF)
 # ============================================================
 
@@ -208,8 +383,6 @@ def _safe_text(text: str, unicode_ok: bool) -> str:
 
     return text.encode("latin-1", "replace").decode("latin-1")
 
-
-import re
 
 _RULE_LINE_RE = re.compile(r"^[\s\-_*=]{3,}$")          # e.g. "---", "___", "***"
 _TABLE_SEP_LINE_RE = re.compile(r"^[\s|:\-]{3,}$")       # e.g. "|---|:---:|---|"
@@ -496,6 +669,13 @@ _DEFAULT_STATE = {
     "student_analysis_response": "",
     "uploaded_student_data": None,
     "pdf_qa_response": "",
+    "video_transcript": "",
+    "video_segments": [],
+    "video_title": "",
+    "video_error": "",
+    "video_material_response": "",
+    "video_qa_response": "",
+    "video_notes_response": "",
 }
 
 for _key, _default in _DEFAULT_STATE.items():
@@ -514,7 +694,7 @@ st.markdown(
 
 st.markdown(
     '<div class="subtitle">'
-    'An intelligent teaching and learning assistant'
+    'An intelligent teaching and learning assistant powered by Gemini'
     '</div>',
     unsafe_allow_html=True
 )
@@ -587,6 +767,136 @@ def show_generated_content(
 
 
 # ============================================================
+# SHARED VIDEO LECTURE UI HELPER
+# ============================================================
+
+def render_video_source_picker(key_prefix: str):
+    """
+    Renders the "how do I get a video in here" UI (YouTube link or file
+    upload) and, once processed, stores the transcript/segments in
+    session_state so any tab (teacher or student) can use them.
+    """
+
+    source_choice = st.radio(
+        "Video Source",
+        ["🔗 YouTube Link", "📁 Upload Video File"],
+        horizontal=True,
+        key=f"{key_prefix}_video_source_choice"
+    )
+
+    if source_choice == "🔗 YouTube Link":
+
+        youtube_url = st.text_input(
+            "YouTube video URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key=f"{key_prefix}_youtube_url"
+        )
+
+        if st.button(
+            "📥 Fetch Transcript",
+            key=f"{key_prefix}_fetch_youtube",
+            use_container_width=True
+        ):
+
+            video_id = extract_youtube_video_id(youtube_url)
+
+            if not video_id:
+                st.warning("Please enter a valid YouTube video URL.")
+            else:
+                with st.spinner("Fetching transcript..."):
+                    segments, full_text, error = fetch_youtube_transcript(video_id)
+
+                if error:
+                    st.session_state.video_error = error
+                    st.session_state.video_transcript = ""
+                    st.session_state.video_segments = []
+                else:
+                    st.session_state.video_transcript = full_text
+                    st.session_state.video_segments = segments
+                    st.session_state.video_title = youtube_url
+                    st.session_state.video_error = ""
+                    st.rerun()
+
+        if youtube_url and extract_youtube_video_id(youtube_url):
+            st.video(youtube_url)
+
+    else:
+
+        uploaded_video = st.file_uploader(
+            "Upload a lecture video",
+            type=["mp4", "mov", "avi", "mkv", "webm"],
+            key=f"{key_prefix}_video_upload"
+        )
+
+        if uploaded_video:
+
+            st.video(uploaded_video)
+
+            if st.button(
+                "🤖 Transcribe with Gemini",
+                key=f"{key_prefix}_transcribe_video",
+                use_container_width=True
+            ):
+
+                with st.spinner(
+                    "Uploading and transcribing video — this can take a "
+                    "minute for longer lectures..."
+                ):
+                    segments, full_text, error = upload_and_transcribe_video(uploaded_video)
+
+                if error:
+                    st.session_state.video_error = error
+                    st.session_state.video_transcript = ""
+                    st.session_state.video_segments = []
+                else:
+                    st.session_state.video_transcript = full_text
+                    st.session_state.video_segments = segments
+                    st.session_state.video_title = uploaded_video.name
+                    st.session_state.video_error = ""
+                    st.rerun()
+
+    if st.session_state.video_error:
+        st.error(st.session_state.video_error)
+
+    if st.session_state.video_transcript:
+
+        st.success(
+            f"✅ Transcript ready for **{st.session_state.video_title}** "
+            f"({len(st.session_state.video_segments)} sections)"
+        )
+
+        with st.expander("📜 View full transcript"):
+            st.text(st.session_state.video_transcript)
+
+
+def get_video_content_for_prompt(key_prefix: str, mode: str) -> str:
+    """
+    Returns the text to feed into a generation prompt, according to the
+    chosen content-usage mode:
+      - "Full transcript"   -> everything
+      - "Selected sections" -> only the sections the user checked
+      - "Reference only"    -> just the title/topic, no transcript body
+    """
+
+    if mode == "Reference only (just the video title/topic)":
+        return f"(Video lecture titled/linked: {st.session_state.video_title} — " \
+               f"use general knowledge of this topic, full transcript not provided.)"
+
+    if mode == "Selected sections only" and st.session_state.video_segments:
+
+        chosen = st.session_state.get(f"{key_prefix}_selected_segments", [])
+        segments_by_label = {
+            seg["label"]: seg for seg in st.session_state.video_segments
+        }
+        chosen_segments = [segments_by_label[label] for label in chosen if label in segments_by_label]
+
+        if chosen_segments:
+            return _build_full_text(chosen_segments)
+
+    return st.session_state.video_transcript
+
+
+# ============================================================
 # TEACHER MODE
 # ============================================================
 
@@ -599,6 +909,7 @@ if user_mode == "👨‍🏫 Teacher":
         "👥 Analyze Students",
         "🎨 Teaching Material",
         "📄 PDF Assistant",
+        "🎥 Video Lecture",
     ])
 
     # --------------------------------------------------------
@@ -1319,15 +1630,45 @@ Do not invent missing student information.
             key="material_extra"
         )
 
+        use_video_for_material = False
+
+        if st.session_state.video_transcript:
+
+            use_video_for_material = st.checkbox(
+                f"🎥 Base this on the extracted video lecture "
+                f"(\"{st.session_state.video_title}\")",
+                key="use_video_for_material"
+            )
+
+        else:
+            st.caption(
+                "ℹ️ Extract a transcript in the **🎥 Video Lecture** tab first "
+                "to generate material that follows an actual lecture."
+            )
+
         if st.button(
             "🎨 Generate Teaching Material",
             key="generate_teaching_material",
             use_container_width=True
         ):
 
-            if not material_topic.strip():
-                st.warning("Please enter a topic.")
+            if not material_topic.strip() and not use_video_for_material:
+                st.warning("Please enter a topic (or use a video lecture as the source).")
             else:
+
+                video_block = ""
+
+                if use_video_for_material:
+                    video_block = f"""
+This material MUST follow the actual lecture below — cover the same
+concepts, in the same order, and do not introduce content the lecture
+does not cover.
+
+Video Lecture Transcript:
+----------------
+{st.session_state.video_transcript[:50000]}
+----------------
+"""
 
                 prompt = f"""
 You are an expert teacher and academic-content designer.
@@ -1354,7 +1695,7 @@ Language:
 
 Additional Instructions:
 {material_extra}
-
+{video_block}
 Make the material classroom-ready.
 
 Where appropriate include:
@@ -1486,6 +1827,139 @@ Instructions:
             "pdf_download_teacher_pdf",
         )
 
+    # --------------------------------------------------------
+    # TEACHER — VIDEO LECTURE
+    # --------------------------------------------------------
+
+    with teacher_tabs[6]:
+
+        st.header("🎥 Turn a Video Lecture Into Teaching Material")
+
+        st.caption(
+            "Paste a YouTube link or upload a lecture recording, extract "
+            "its transcript, then generate material that actually follows "
+            "what was taught."
+        )
+
+        render_video_source_picker(key_prefix="teacher")
+
+        if st.session_state.video_segments:
+
+            with st.expander("✂️ Pick specific sections (optional)"):
+                st.multiselect(
+                    "Only these sections will be used when "
+                    "'Selected sections only' is chosen below",
+                    options=[seg["label"] for seg in st.session_state.video_segments],
+                    key="teacher_selected_segments"
+                )
+
+        if st.session_state.video_transcript:
+
+            st.divider()
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                video_material_subject = st.text_input(
+                    "Subject",
+                    placeholder="Example: Machine Learning",
+                    key="video_material_subject"
+                )
+
+            with col2:
+                video_material_type = st.selectbox(
+                    "Material Type",
+                    [
+                        "Lecture Notes",
+                        "Presentation Outline",
+                        "Handout",
+                        "Revision Sheet",
+                        "Quiz Prep Summary",
+                        "Case Study",
+                    ],
+                    key="video_material_type"
+                )
+
+            video_content_mode = st.selectbox(
+                "How should the video be used?",
+                [
+                    "Full transcript",
+                    "Selected sections only",
+                    "Reference only (just the video title/topic)",
+                ],
+                key="video_content_mode",
+                help=(
+                    "Full transcript: material mirrors the whole video. "
+                    "Selected sections only: uses just what you picked "
+                    "above. Reference only: uses the video as a topic "
+                    "pointer without feeding the transcript text."
+                )
+            )
+
+            video_material_extra = st.text_area(
+                "Additional Instructions",
+                placeholder="Example: Add 3 practice questions per section.",
+                key="video_material_extra"
+            )
+
+            if st.button(
+                "🎨 Generate Material From Video",
+                key="generate_video_material",
+                use_container_width=True
+            ):
+
+                video_content = get_video_content_for_prompt(
+                    "teacher", video_content_mode
+                )
+
+                prompt = f"""
+You are an expert teacher and academic-content designer.
+
+Create classroom-ready {video_material_type.lower()} based on the video
+lecture content below. Follow the same concepts and order as the
+source content — do not invent material the source does not cover
+(unless the mode is "reference only", in which case use the topic as
+a general guide).
+
+Subject:
+{video_material_subject}
+
+Video Lecture Content ({video_content_mode}):
+----------------
+{video_content[:50000]}
+----------------
+
+Education Level:
+{education_level}
+
+Difficulty:
+{difficulty}
+
+Language:
+{response_language}
+
+Additional Instructions:
+{video_material_extra}
+
+Where appropriate include:
+- Learning objectives
+- Key definitions and concepts (matching what the lecture covered)
+- Examples used in the lecture (or equivalent ones)
+- A short summary
+- Suggested practice questions
+"""
+
+                with st.spinner("Generating material from the video..."):
+                    st.session_state.video_material_response = ask_gemini(prompt)
+
+        show_generated_content(
+            "video_material_response",
+            "🎨 Generated Teaching Material",
+            f"Teaching Material — {st.session_state.get('video_title', 'Video Lecture')}",
+            "video_teaching_material.pdf",
+            "pdf_download_video_material",
+        )
+
 
 # ============================================================
 # STUDENT MODE
@@ -1500,6 +1974,7 @@ else:
         "📝 Practice MCQs",
         "🎯 Take Quiz",
         "📄 PDF Assistant",
+        "🎥 Video Lecture",
     ])
 
     # --------------------------------------------------------
@@ -2262,6 +2737,165 @@ Instructions:
             "pdf_download_student_pdf",
         )
 
+    # --------------------------------------------------------
+    # STUDENT — VIDEO LECTURE
+    # --------------------------------------------------------
+
+    with student_tabs[6]:
+
+        st.header("🎥 Learn From a Video Lecture")
+
+        st.caption(
+            "Paste a YouTube link or upload a lecture recording, then ask "
+            "questions or generate notes straight from what was taught."
+        )
+
+        render_video_source_picker(key_prefix="student")
+
+        if st.session_state.video_segments:
+
+            with st.expander("✂️ Focus on specific sections (optional)"):
+                st.multiselect(
+                    "Only these sections will be used when "
+                    "'Selected sections only' is chosen below",
+                    options=[seg["label"] for seg in st.session_state.video_segments],
+                    key="student_selected_segments"
+                )
+
+        if st.session_state.video_transcript:
+
+            st.divider()
+
+            video_use_mode = st.selectbox(
+                "Use which part of the video?",
+                ["Full transcript", "Selected sections only"],
+                key="student_video_use_mode"
+            )
+
+            video_action = st.radio(
+                "What do you want to do?",
+                ["Ask a question", "Generate notes"],
+                horizontal=True,
+                key="student_video_action"
+            )
+
+            if video_action == "Ask a question":
+
+                video_question = st.text_area(
+                    "Ask something about this video lecture",
+                    placeholder="Example: Explain the second concept covered in the video.",
+                    height=130,
+                    key="student_video_question"
+                )
+
+                if st.button(
+                    "🤖 Ask About Video",
+                    key="student_video_ask",
+                    use_container_width=True
+                ):
+
+                    if not video_question.strip():
+                        st.warning("Please enter a question.")
+                    else:
+
+                        video_content = get_video_content_for_prompt(
+                            "student", video_use_mode
+                        )
+
+                        prompt = f"""
+You are an AI student tutor.
+
+Answer the student's question using the video lecture transcript
+provided below.
+
+Video Lecture Transcript:
+----------------
+{video_content[:50000]}
+----------------
+
+Student Question:
+{video_question}
+
+Difficulty:
+{difficulty}
+
+Education Level:
+{education_level}
+
+Language:
+{response_language}
+
+Instructions:
+
+1. Base the answer primarily on the video transcript.
+2. Reference the approximate timestamp when helpful.
+3. Do not invent information.
+4. If the answer cannot be found in the transcript, clearly say so.
+5. Use examples when useful.
+"""
+
+                        with st.spinner("Analyzing the video lecture..."):
+                            st.session_state.video_qa_response = ask_gemini(prompt)
+
+                show_generated_content(
+                    "video_qa_response",
+                    "🤖 AI Answer",
+                    "Video Lecture — Answer",
+                    "video_lecture_answer.pdf",
+                    "pdf_download_video_qa",
+                )
+
+            else:
+
+                if st.button(
+                    "📚 Generate Notes From Video",
+                    key="student_video_notes",
+                    use_container_width=True
+                ):
+
+                    video_content = get_video_content_for_prompt(
+                        "student", video_use_mode
+                    )
+
+                    prompt = f"""
+You are an AI study-notes generator.
+
+Create clear, well-organized study notes from the video lecture
+transcript below.
+
+Video Lecture Transcript:
+----------------
+{video_content[:50000]}
+----------------
+
+Difficulty:
+{difficulty}
+
+Education Level:
+{education_level}
+
+Language:
+{response_language}
+
+Instructions:
+
+1. Organize notes with headings and bullet points.
+2. Follow the order the lecture covered topics in.
+3. Include a short summary at the end.
+4. Do not invent information not present in the transcript.
+"""
+
+                    with st.spinner("Generating notes from the video..."):
+                        st.session_state.video_notes_response = ask_gemini(prompt)
+
+                show_generated_content(
+                    "video_notes_response",
+                    "📚 Notes From Video",
+                    f"Video Notes — {st.session_state.get('video_title', 'Lecture')}",
+                    "video_notes.pdf",
+                    "pdf_download_video_notes",
+                )
+
 
 # ============================================================
 # FOOTER
@@ -2271,4 +2905,5 @@ st.markdown("---")
 
 st.caption(
     "🎓 AI Teaching Assistant | Teacher Mode + Student Mode | "
+    "Powered by Gemini + Streamlit"
 )
