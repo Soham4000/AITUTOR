@@ -79,6 +79,273 @@ model = configure_gemini()
 
 
 # ============================================================
+# AGENT MODE — TOOL SCHEMAS
+# ============================================================
+#
+# These are the actions the agent is allowed to choose between. Unlike
+# every other tab in this app, the agent decides WHICH of these to call,
+# WHAT arguments to pass, and WHEN it's done — based on a natural-language
+# goal instead of a button click.
+
+AGENT_TOOLS = [
+    {
+        "name": "check_student_risk_data",
+        "description": (
+            "Check the uploaded student CSV for which students are "
+            "struggling (low attendance or flagged at_risk). Call this "
+            "FIRST when preparing for a class so material can be tailored "
+            "to students who need help."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "read_lesson_material",
+        "description": (
+            "Read the previously uploaded lesson/teaching PDF (from the "
+            "PDF Assistant tab) to see what was already taught, so a "
+            "review targets gaps instead of repeating everything."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "generate_lesson_plan",
+        "description": (
+            "Create a classroom-ready lesson plan for a topic. Use this "
+            "when the class needs fresh instruction or a targeted review."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "duration": {"type": "string"},
+                "focus": {
+                    "type": "string",
+                    "description": (
+                        "What to emphasize, e.g. 'conceptual review' or "
+                        "'practical/hands-on review of weak points'."
+                    ),
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "generate_mcqs",
+        "description": (
+            "Generate multiple-choice practice questions on a topic. Use "
+            "this when students would benefit from low-stakes self-check "
+            "practice before a graded quiz or exam."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "count": {"type": "integer"},
+                "difficulty": {"type": "string"},
+            },
+            "required": ["topic", "count"],
+        },
+    },
+    {
+        "name": "generate_quiz",
+        "description": (
+            "Generate a graded quiz on a topic. Use this as a final "
+            "assessment step, typically after practice material has "
+            "already been prepared."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["topic"],
+        },
+    },
+]
+
+AGENT_MAX_STEPS = 8  # safety cap so a confused loop can't run forever
+
+
+def configure_gemini_agent():
+    """Separate model instance WITH tools attached. The plain `model`
+    above is left untouched so every existing tab keeps working exactly
+    as before."""
+
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return None
+
+    genai.configure(api_key=api_key)
+
+    return genai.GenerativeModel(
+        "gemini-3.5-flash",
+        tools=AGENT_TOOLS,
+    )
+
+
+agent_model = configure_gemini_agent()
+
+
+def execute_agent_tool(name, args, ctx):
+    """
+    Dispatch table: actually runs the tool the agent chose to call.
+
+    ctx carries whatever state the tools need:
+        ctx["pdf_text"]        -> extracted lesson PDF text (or "")
+        ctx["student_df"]      -> uploaded student DataFrame (or None)
+        ctx["education_level"] -> from sidebar
+        ctx["language"]        -> from sidebar
+        ctx["outputs"]         -> dict this function fills in with results
+
+    Returns a short string result that gets fed back to the model so it
+    can decide the next step.
+    """
+
+    if name == "check_student_risk_data":
+        df = ctx.get("student_df")
+        if df is None:
+            return "No student CSV has been uploaded. Skip risk-based tailoring."
+
+        risk_col = None
+        for col in df.columns:
+            if str(col).strip().lower() == "at_risk":
+                risk_col = col
+                break
+
+        if risk_col is None:
+            return "No At_Risk column found in the uploaded CSV. Skip risk-based tailoring."
+
+        risk_rows = df[df[risk_col].astype(str).str.lower().isin(["yes", "true", "1"])]
+
+        id_col = df.columns[0]
+
+        if len(risk_rows):
+            return (
+                f"{len(risk_rows)} of {len(df)} students are flagged at-risk. "
+                f"Struggling students: {risk_rows[id_col].tolist()}"
+            )
+        return f"No at-risk students found among {len(df)} records."
+
+    if name == "read_lesson_material":
+        text = ctx.get("pdf_text", "")
+        if not text.strip():
+            return "No lesson PDF has been uploaded/read yet in the PDF Assistant tab."
+        return f"Lesson material excerpt (first 800 chars): {text[:800]}"
+
+    if name == "generate_lesson_plan":
+        topic = args.get("topic", "the topic")
+        duration = args.get("duration", "45 minutes")
+        focus = args.get("focus", "balanced coverage")
+        prompt = f"""You are an expert teacher. Create a {duration} lesson plan
+for the topic "{topic}", focused on: {focus}.
+Education level: {ctx.get('education_level')}
+Language: {ctx.get('language')}
+Include objectives, sequence, examples, and a quick assessment."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Lesson Plan"] = result
+        return f"Lesson plan generated ({len(result)} chars). Stored as 'Lesson Plan'."
+
+    if name == "generate_mcqs":
+        topic = args.get("topic", "the topic")
+        count = args.get("count", 5)
+        difficulty = args.get("difficulty", "Medium")
+        prompt = f"""Generate {count} multiple-choice practice questions on "{topic}"
+at {difficulty} difficulty, in {ctx.get('language')}.
+Return ONLY valid JSON:
+[{{"question": "...", "options": ["A","B","C","D"], "answer": 0, "explanation": "..."}}]"""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Practice MCQs"] = result
+        return f"{count} MCQs generated. Stored as 'Practice MCQs'."
+
+    if name == "generate_quiz":
+        topic = args.get("topic", "the topic")
+        count = args.get("count", 5)
+        prompt = f"""Generate {count} graded quiz questions on "{topic}", in {ctx.get('language')}.
+Return ONLY valid JSON:
+[{{"question": "...", "options": ["A","B","C","D"], "answer": 0, "explanation": "..."}}]"""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Graded Quiz"] = result
+        return f"{count}-question quiz generated. Stored as 'Graded Quiz'."
+
+    return f"Unknown tool: {name}"
+
+
+def run_agent(goal: str, ctx: dict, log=print):
+    """
+    The actual agent loop. Gemini decides which tool to call and with
+    what arguments, sees the result, and decides the NEXT action -- until
+    it decides the goal is satisfied (no more function calls) or the
+    safety cap is hit.
+    """
+
+    if agent_model is None:
+        log("Agent Mode is not available: Gemini API key not configured.")
+        return "Agent Mode is not available: Gemini API key not configured.", {}
+
+    chat = agent_model.start_chat()
+    step = 0
+
+    try:
+        response = chat.send_message(goal)
+    except Exception as e:
+        log(f"Agent API error: {e}")
+        return f"Agent API error: {e}", ctx.get("outputs", {})
+
+    while step < AGENT_MAX_STEPS:
+        step += 1
+
+        candidate = response.candidates[0]
+        function_calls = [
+            part.function_call
+            for part in candidate.content.parts
+            if part.function_call
+        ]
+
+        if not function_calls:
+            final_text = "".join(
+                part.text for part in candidate.content.parts if part.text
+            )
+            log(f"**Step {step}:** Agent finished — no further actions needed.")
+            return final_text, ctx.get("outputs", {})
+
+        call = function_calls[0]
+        args = dict(call.args)
+        log(f"**Step {step}:** Agent calls `{call.name}({args})`")
+
+        result = execute_agent_tool(call.name, args, ctx)
+        log(f"**Step {step} result:** {result}")
+
+        try:
+            response = chat.send_message(
+                genai.protos.Content(
+                    parts=[genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=call.name,
+                            response={"result": result},
+                        )
+                    )]
+                )
+            )
+        except Exception as e:
+            log(f"Agent API error: {e}")
+            return f"Agent API error: {e}", ctx.get("outputs", {})
+
+    log("**Stopped:** hit the safety cap on steps.")
+    final_text = "".join(
+        part.text for part in response.candidates[0].content.parts if part.text
+    )
+    return final_text, ctx.get("outputs", {})
+
+
+# ============================================================
 # GEMINI HELPER FUNCTION
 # ============================================================
 
@@ -496,6 +763,8 @@ _DEFAULT_STATE = {
     "student_analysis_response": "",
     "uploaded_student_data": None,
     "pdf_qa_response": "",
+    "agent_final_summary": "",
+    "agent_outputs": {},
 }
 
 for _key, _default in _DEFAULT_STATE.items():
@@ -514,7 +783,7 @@ st.markdown(
 
 st.markdown(
     '<div class="subtitle">'
-    'An intelligent teaching and learning assistant'
+    'An intelligent teaching and learning assistant powered by Gemini'
     '</div>',
     unsafe_allow_html=True
 )
@@ -599,6 +868,7 @@ if user_mode == "👨‍🏫 Teacher":
         "👥 Analyze Students",
         "🎨 Teaching Material",
         "📄 PDF Assistant",
+        "🤖 Agent Mode",
     ])
 
     # --------------------------------------------------------
@@ -1486,6 +1756,100 @@ Instructions:
             "pdf_download_teacher_pdf",
         )
 
+    # --------------------------------------------------------
+    # TEACHER — AGENT MODE
+    # --------------------------------------------------------
+
+    with teacher_tabs[6]:
+
+        st.header("🤖 Autonomous Course Prep Agent")
+
+        st.write(
+            "Describe a goal instead of picking a tool. The agent decides "
+            "which of the actions below to use, in what order, and with "
+            "what arguments — checking student risk data and lesson "
+            "material along the way if it decides that's useful."
+        )
+
+        with st.expander("What can the agent do on its own?"):
+            st.markdown(
+                "- Check the uploaded student CSV for at-risk students\n"
+                "- Read the previously uploaded lesson PDF\n"
+                "- Generate a lesson plan\n"
+                "- Generate practice MCQs\n"
+                "- Generate a graded quiz\n\n"
+                "It chooses which of these to call, in what order, and "
+                "with what arguments — you only state the goal."
+            )
+
+        agent_goal = st.text_area(
+            "Describe what you want prepared",
+            placeholder=(
+                "Example: Prepare my class for next week's midterm on "
+                "Chapter 5: Neural Networks"
+            ),
+            height=100,
+            key="agent_goal"
+        )
+
+        if st.button(
+            "🚀 Run Agent",
+            key="run_agent_button",
+            use_container_width=True
+        ):
+
+            if not agent_goal.strip():
+                st.warning("Please describe a goal for the agent.")
+            elif agent_model is None:
+                st.error(
+                    "Agent Mode needs GEMINI_API_KEY configured in "
+                    "Streamlit secrets."
+                )
+            else:
+
+                ctx = {
+                    "pdf_text": st.session_state.get("pdf_text", ""),
+                    "student_df": st.session_state.get("uploaded_student_data"),
+                    "education_level": education_level,
+                    "language": response_language,
+                    "outputs": {},
+                }
+
+                log_lines = []
+                log_area = st.empty()
+
+                def _agent_log(msg):
+                    log_lines.append(msg)
+                    log_area.markdown("\n\n".join(log_lines))
+
+                with st.spinner("Agent is planning and acting..."):
+                    final_text, outputs = run_agent(
+                        agent_goal, ctx, log=_agent_log
+                    )
+
+                st.session_state.agent_final_summary = final_text
+                st.session_state.agent_outputs = outputs
+
+        if st.session_state.get("agent_final_summary"):
+
+            st.markdown("---")
+            st.subheader("✅ Agent Summary")
+            st.markdown(st.session_state.agent_final_summary)
+
+            outputs = st.session_state.get("agent_outputs", {})
+
+            for artifact_name, artifact_content in outputs.items():
+
+                st.subheader(artifact_name)
+                st.markdown(artifact_content)
+
+                render_pdf_download_button(
+                    artifact_content,
+                    title=artifact_name,
+                    filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
+                    key=f"pdf_download_agent_{artifact_name}",
+                )
+
 
 # ============================================================
 # STUDENT MODE
@@ -2271,4 +2635,5 @@ st.markdown("---")
 
 st.caption(
     "🎓 AI Teaching Assistant | Teacher Mode + Student Mode | "
+    "Powered by Gemini + Streamlit"
 )
