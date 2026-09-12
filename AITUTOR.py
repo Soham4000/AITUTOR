@@ -97,7 +97,7 @@ AGENT_TOOLS = [
             "to students who need help."
         ),
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {},
         },
     },
@@ -109,7 +109,7 @@ AGENT_TOOLS = [
             "review targets gaps instead of repeating everything."
         ),
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {},
         },
     },
@@ -120,12 +120,12 @@ AGENT_TOOLS = [
             "when the class needs fresh instruction or a targeted review."
         ),
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "topic": {"type": "string"},
-                "duration": {"type": "string"},
+                "topic": {"type": "STRING"},
+                "duration": {"type": "STRING"},
                 "focus": {
-                    "type": "string",
+                    "type": "STRING",
                     "description": (
                         "What to emphasize, e.g. 'conceptual review' or "
                         "'practical/hands-on review of weak points'."
@@ -143,11 +143,11 @@ AGENT_TOOLS = [
             "practice before a graded quiz or exam."
         ),
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "topic": {"type": "string"},
-                "count": {"type": "integer"},
-                "difficulty": {"type": "string"},
+                "topic": {"type": "STRING"},
+                "count": {"type": "INTEGER"},
+                "difficulty": {"type": "STRING"},
             },
             "required": ["topic", "count"],
         },
@@ -160,10 +160,10 @@ AGENT_TOOLS = [
             "already been prepared."
         ),
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "topic": {"type": "string"},
-                "count": {"type": "integer"},
+                "topic": {"type": "STRING"},
+                "count": {"type": "INTEGER"},
             },
             "required": ["topic"],
         },
