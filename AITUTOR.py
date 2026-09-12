@@ -22,28 +22,214 @@ st.set_page_config(
 # ============================================================
 # CUSTOM CSS
 # ============================================================
+#
+# Design direction: "Academic ledger" — deep study-navy and honor-roll
+# gold, serif headings for gravitas, clean sans for legibility. Built
+# for this subject specifically (a gradebook/classroom tool), not the
+# generic cream+terracotta or identical-rounded-SaaS-card defaults.
 
 st.markdown("""
 <style>
 
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --ink-900: #16213E;
+    --ink-800: #1F3A5F;
+    --ink-700: #2C4A73;
+    --gold-600: #C6912F;
+    --gold-500: #D9A441;
+    --gold-200: #F3DCA0;
+    --paper-100: #FAFAF8;
+    --paper-000: #FFFFFF;
+    --text-900: #1A1F2B;
+    --text-600: #5B6472;
+    --line-200: #E4E1D8;
+    --success-700: #3F7D58;
+}
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+    color: var(--text-900);
+}
+
+h1, h2, h3, .main-title {
+    font-family: 'Fraunces', serif;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.stApp {
+    background: var(--paper-100);
+}
+
+/* ---------- Header banner ---------- */
+
+.app-banner {
+    background: linear-gradient(120deg, var(--ink-900) 0%, var(--ink-800) 65%, var(--ink-700) 100%);
+    border-radius: 10px;
+    padding: 28px 36px;
+    margin-bottom: 22px;
+    border-bottom: 3px solid var(--gold-500);
+}
+
 .main-title {
-    font-size: 42px;
+    font-size: 34px;
     font-weight: 700;
-    text-align: center;
-    margin-bottom: 5px;
+    color: var(--paper-000);
+    text-align: left;
+    margin: 0 0 4px 0;
 }
 
 .subtitle {
-    text-align: center;
-    font-size: 18px;
-    margin-bottom: 30px;
+    text-align: left;
+    font-size: 15px;
+    font-family: 'Inter', sans-serif;
+    color: var(--gold-200);
+    margin: 0;
 }
 
+/* ---------- Generic content card ---------- */
+
 .card {
-    padding: 20px;
-    border-radius: 15px;
-    border: 1px solid rgba(128,128,128,0.3);
-    margin-bottom: 20px;
+    padding: 18px 22px;
+    border-radius: 8px;
+    border: 1px solid var(--line-200);
+    border-left: 4px solid var(--gold-500);
+    background: var(--paper-000);
+    margin-bottom: 18px;
+}
+
+/* ---------- Sidebar ---------- */
+
+section[data-testid="stSidebar"] {
+    background: var(--ink-900);
+}
+
+section[data-testid="stSidebar"] * {
+    color: var(--paper-100) !important;
+}
+
+section[data-testid="stSidebar"] .stSelectbox > div > div,
+section[data-testid="stSidebar"] input {
+    background-color: var(--ink-800) !important;
+    border-color: var(--ink-700) !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] {
+    color: var(--ink-900) !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] * {
+    color: var(--ink-900) !important;
+}
+
+/* ---------- Tabs ---------- */
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+    border-bottom: 1px solid var(--line-200);
+}
+
+.stTabs [data-baseweb="tab"] {
+    font-family: 'Fraunces', serif;
+    font-weight: 600;
+    color: var(--text-600);
+    padding: 10px 16px;
+}
+
+.stTabs [aria-selected="true"] {
+    color: var(--ink-900);
+    border-bottom: 3px solid var(--gold-500) !important;
+}
+
+/* ---------- Buttons ---------- */
+
+.stButton > button {
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    border-radius: 6px;
+    border: 1px solid var(--ink-900);
+    background: var(--ink-900);
+    color: var(--paper-000);
+    transition: background 0.15s ease, transform 0.05s ease;
+}
+
+.stButton > button:hover {
+    background: var(--ink-800);
+    border-color: var(--ink-800);
+}
+
+.stButton > button:active {
+    transform: scale(0.99);
+}
+
+.stButton > button[kind="primary"],
+div[data-testid="stDownloadButton"] > button {
+    background: var(--gold-500);
+    border-color: var(--gold-600);
+    color: var(--ink-900);
+}
+
+.stButton > button[kind="primary"]:hover,
+div[data-testid="stDownloadButton"] > button:hover {
+    background: var(--gold-600);
+}
+
+/* ---------- Metrics ---------- */
+
+div[data-testid="stMetric"] {
+    background: var(--paper-000);
+    border: 1px solid var(--line-200);
+    border-top: 3px solid var(--gold-500);
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+div[data-testid="stMetricValue"] {
+    color: var(--ink-900);
+    font-family: 'Fraunces', serif;
+}
+
+/* ---------- Alerts / status ---------- */
+
+div[data-testid="stAlertContentInfo"],
+div[data-testid="stAlertContentSuccess"],
+div[data-testid="stAlertContentError"],
+div[data-testid="stAlertContentWarning"] {
+    border-radius: 8px;
+}
+
+/* ---------- Expanders ---------- */
+
+details[data-testid="stExpander"] {
+    border: 1px solid var(--line-200);
+    border-radius: 8px;
+    background: var(--paper-000);
+}
+
+/* ---------- Chat (Agent Mode) ---------- */
+
+div[data-testid="stChatMessage"] {
+    border-radius: 10px;
+    padding: 4px 6px;
+    margin-bottom: 6px;
+}
+
+div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+    background: var(--ink-900);
+}
+
+div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) * {
+    color: var(--paper-100) !important;
+}
+
+div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+    background: var(--paper-000);
+    border-left: 4px solid var(--gold-500);
+    border: 1px solid var(--line-200);
+    border-left-width: 4px;
+    border-left-color: var(--gold-500);
 }
 
 </style>
@@ -1308,13 +1494,9 @@ for _key, _default in _DEFAULT_STATE.items():
 # ============================================================
 
 st.markdown(
-    '<div class="main-title">🎓 AI Teaching Assistant</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    'An intelligent teaching and learning assistant powered by Gemini'
+    '<div class="app-banner">'
+    '<div class="main-title">🎓 AI Teaching Assistant</div>'
+    '<div class="subtitle">An intelligent teaching and learning assistant, powered by Gemini</div>'
     '</div>',
     unsafe_allow_html=True
 )
