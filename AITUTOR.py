@@ -84,8 +84,30 @@ model = configure_gemini()
 #
 # These are the actions the agent is allowed to choose between. Unlike
 # every other tab in this app, the agent decides WHICH of these to call,
-# WHAT arguments to pass, and WHEN it's done — based on a natural-language
-# goal instead of a button click.
+# WHAT arguments to pass, WHETHER TO CALL SEVERAL AT ONCE, and WHEN it's
+# done — based on a natural-language goal instead of a button click.
+
+AGENT_SYSTEM_INSTRUCTION = """You are an autonomous teaching-prep agent \
+embedded in a teacher's classroom-prep tool.
+
+Guidelines:
+- Break the teacher's goal into the smallest set of concrete actions
+  needed to satisfy it.
+- Call multiple independent tools in the SAME turn when their results
+  don't depend on each other (for example, practice MCQs and a graded
+  quiz can usually be generated together once the topic is known).
+  Sequence tools that genuinely depend on each other's output (for
+  example, check student data or read lesson material BEFORE deciding
+  what a lesson plan should emphasize).
+- Only call ask_clarifying_question when the goal is genuinely
+  ambiguous or missing information you cannot reasonably infer (for
+  example, no subject or topic given at all). Call it ALONE, never
+  combined with other tool calls, and only once per genuine gap.
+  Prefer acting on a sensible default over asking.
+- When every needed artifact has been produced, respond with a concise
+  plain-text summary of what you made and why, with no further tool
+  calls.
+"""
 
 AGENT_TOOLS = [
     {
@@ -95,6 +117,21 @@ AGENT_TOOLS = [
             "struggling (low attendance or flagged at_risk). Call this "
             "FIRST when preparing for a class so material can be tailored "
             "to students who need help."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        },
+    },
+    {
+        "name": "analyze_class_performance",
+        "description": (
+            "Run a deeper statistical pass over the uploaded student CSV: "
+            "averages/min/max for every numeric column, and how at-risk "
+            "students compare to the class average on each one. Use this "
+            "instead of (or in addition to) check_student_risk_data when "
+            "you need to understand PATTERNS across the class, not just "
+            "who is flagged."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -168,9 +205,101 @@ AGENT_TOOLS = [
             "required": ["topic"],
         },
     },
+    {
+        "name": "generate_assignment",
+        "description": (
+            "Create a full student assignment (tasks, instructions, "
+            "rubric) for a topic. Use this when the goal calls for "
+            "homework or take-home practice, not just in-class material."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topic": {"type": "STRING"},
+                "assignment_type": {
+                    "type": "STRING",
+                    "description": (
+                        "Theory, Programming, Case Study, Research, "
+                        "Practical, or Mixed."
+                    ),
+                },
+                "count": {
+                    "type": "INTEGER",
+                    "description": "Number of tasks in the assignment.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "generate_question_paper",
+        "description": (
+            "Create a formal examination-style question paper covering "
+            "one or more topics/units. Use this when the goal explicitly "
+            "calls for an exam or test paper, distinct from a lightweight "
+            "practice quiz."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topics": {
+                    "type": "STRING",
+                    "description": "Topics or units to cover, comma-separated.",
+                },
+                "count": {"type": "INTEGER"},
+                "marks": {"type": "INTEGER"},
+            },
+            "required": ["topics"],
+        },
+    },
+    {
+        "name": "generate_teaching_material",
+        "description": (
+            "Create supporting teaching material other than a lesson plan "
+            "or assessment — lecture notes, a handout, a revision sheet, "
+            "a case study, or a lab exercise. Use this when the goal asks "
+            "for reference/handout material rather than a structured "
+            "lesson plan or a graded item."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topic": {"type": "STRING"},
+                "material_type": {
+                    "type": "STRING",
+                    "description": (
+                        "Lecture Notes, Class Handout, Revision Sheet, "
+                        "Case Study, or Lab Exercise."
+                    ),
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "ask_clarifying_question",
+        "description": (
+            "Pause and ask the teacher a direct question when the goal is "
+            "genuinely ambiguous or missing information you cannot "
+            "reasonably infer (e.g. no subject/topic stated anywhere). "
+            "MUST be called alone, never combined with other tool calls "
+            "in the same turn. Do not use this for preferences that have "
+            "a sensible default — only for real gaps."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "question": {"type": "STRING"},
+            },
+            "required": ["question"],
+        },
+    },
 ]
 
-AGENT_MAX_STEPS = 8  # safety cap so a confused loop can't run forever
+AGENT_MAX_STEPS = 12  # safety cap so a confused loop can't run forever
 
 
 def configure_gemini_agent():
@@ -188,11 +317,120 @@ def configure_gemini_agent():
     return genai.GenerativeModel(
         "gemini-3.5-flash",
         tools=AGENT_TOOLS,
+        system_instruction=AGENT_SYSTEM_INSTRUCTION,
     )
 
 
 agent_model = configure_gemini_agent()
 
+
+# ------------------------------------------------------------
+# Self-correcting JSON generation
+# ------------------------------------------------------------
+#
+# Gemini occasionally wraps JSON in prose or code fences, or drops a
+# field. Instead of failing the whole agent step, this retries with the
+# broken output fed back in as an error correction — the agent's own
+# artifacts get a chance to fix themselves before giving up.
+
+def _clean_json_block(raw: str) -> str:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "", 1)
+        cleaned = cleaned.replace("```", "", 1).strip()
+    return cleaned
+
+
+def _ask_for_json(base_prompt: str, max_tries: int = 3):
+    """Returns (parsed_list, raw_text, error). error is None on success."""
+
+    import json as _json
+
+    prompt = base_prompt
+    last_raw = ""
+
+    for attempt in range(1, max_tries + 1):
+        raw = ask_gemini(prompt)
+        last_raw = raw
+
+        if is_gemini_error(raw):
+            return None, raw, raw
+
+        try:
+            parsed = _json.loads(_clean_json_block(raw))
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed, raw, None
+        except Exception:
+            pass
+
+        prompt = (
+            base_prompt
+            + "\n\nYour previous response was not a valid JSON array matching "
+            "the required schema. Return ONLY the JSON array and nothing "
+            "else — no prose, no code fences.\n\nYour previous output was:\n"
+            + raw[:800]
+        )
+
+    return None, last_raw, f"Could not produce valid JSON after {max_tries} tries."
+
+
+# ------------------------------------------------------------
+# Deeper class-performance analysis
+# ------------------------------------------------------------
+
+def _find_risk_column(df):
+    for col in df.columns:
+        if str(col).strip().lower() == "at_risk":
+            return col
+    return None
+
+
+def _analyze_class_performance(df) -> str:
+    lines = [f"Total students: {len(df)}"]
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    if not numeric_cols:
+        lines.append("No numeric columns found to analyze.")
+
+    for col in numeric_cols:
+        try:
+            lines.append(
+                f"{col}: class average={df[col].mean():.1f}, "
+                f"min={df[col].min()}, max={df[col].max()}"
+            )
+        except Exception:
+            continue
+
+    risk_col = _find_risk_column(df)
+
+    if risk_col and numeric_cols:
+        risky = df[df[risk_col].astype(str).str.lower().isin(["yes", "true", "1"])]
+
+        if len(risky):
+            for col in numeric_cols:
+                try:
+                    risky_avg = risky[col].mean()
+                    overall_avg = df[col].mean()
+                    gap = risky_avg - overall_avg
+                    lines.append(
+                        f"At-risk students average {col}={risky_avg:.1f} "
+                        f"vs class average {overall_avg:.1f} "
+                        f"(gap: {gap:+.1f})"
+                    )
+                except Exception:
+                    continue
+        else:
+            lines.append("No students are currently flagged at-risk.")
+    elif not risk_col:
+        lines.append("No At_Risk column found, so risk-gap comparison was skipped.")
+
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------
+# Tool dispatch
+# ------------------------------------------------------------
 
 def execute_agent_tool(name, args, ctx):
     """
@@ -204,6 +442,8 @@ def execute_agent_tool(name, args, ctx):
         ctx["education_level"] -> from sidebar
         ctx["language"]        -> from sidebar
         ctx["outputs"]         -> dict this function fills in with results
+        ctx["quiz_questions"]  -> parsed quiz JSON, when generate_quiz
+                                   succeeds, for interactive rendering
 
     Returns a short string result that gets fed back to the model so it
     can decide the next step.
@@ -214,17 +454,12 @@ def execute_agent_tool(name, args, ctx):
         if df is None:
             return "No student CSV has been uploaded. Skip risk-based tailoring."
 
-        risk_col = None
-        for col in df.columns:
-            if str(col).strip().lower() == "at_risk":
-                risk_col = col
-                break
+        risk_col = _find_risk_column(df)
 
         if risk_col is None:
             return "No At_Risk column found in the uploaded CSV. Skip risk-based tailoring."
 
         risk_rows = df[df[risk_col].astype(str).str.lower().isin(["yes", "true", "1"])]
-
         id_col = df.columns[0]
 
         if len(risk_rows):
@@ -233,6 +468,12 @@ def execute_agent_tool(name, args, ctx):
                 f"Struggling students: {risk_rows[id_col].tolist()}"
             )
         return f"No at-risk students found among {len(df)} records."
+
+    if name == "analyze_class_performance":
+        df = ctx.get("student_df")
+        if df is None:
+            return "No student CSV has been uploaded. Skip class-performance analysis."
+        return _analyze_class_performance(df)
 
     if name == "read_lesson_material":
         text = ctx.get("pdf_text", "")
@@ -261,9 +502,12 @@ Include objectives, sequence, examples, and a quick assessment."""
 at {difficulty} difficulty, in {ctx.get('language')}.
 Return ONLY valid JSON:
 [{{"question": "...", "options": ["A","B","C","D"], "answer": 0, "explanation": "..."}}]"""
-        result = ask_gemini(prompt)
-        ctx.setdefault("outputs", {})["Practice MCQs"] = result
-        return f"{count} MCQs generated. Stored as 'Practice MCQs'."
+        parsed, raw, error = _ask_for_json(prompt)
+        if error:
+            return f"Failed to generate valid MCQs after retries: {error}"
+        ctx.setdefault("outputs", {})["Practice MCQs"] = raw
+        ctx["mcq_questions"] = parsed
+        return f"{len(parsed)} MCQs generated and validated as JSON. Stored as 'Practice MCQs'."
 
     if name == "generate_quiz":
         topic = args.get("topic", "the topic")
@@ -271,78 +515,200 @@ Return ONLY valid JSON:
         prompt = f"""Generate {count} graded quiz questions on "{topic}", in {ctx.get('language')}.
 Return ONLY valid JSON:
 [{{"question": "...", "options": ["A","B","C","D"], "answer": 0, "explanation": "..."}}]"""
+        parsed, raw, error = _ask_for_json(prompt)
+        if error:
+            return f"Failed to generate valid quiz after retries: {error}"
+        ctx.setdefault("outputs", {})["Graded Quiz"] = raw
+        ctx["quiz_questions"] = parsed
+        return f"{len(parsed)}-question quiz generated and validated as JSON. Stored as 'Graded Quiz', ready to take interactively."
+
+    if name == "generate_assignment":
+        subject = args.get("subject", "")
+        topic = args.get("topic", "the topic")
+        assignment_type = args.get("assignment_type", "Mixed")
+        count = args.get("count", 5)
+        prompt = f"""You are an expert college teacher. Create a complete student
+assignment.
+Subject: {subject}
+Topic: {topic}
+Assignment Type: {assignment_type}
+Number of Tasks: {count}
+Education Level: {ctx.get('education_level')}
+Language: {ctx.get('language')}
+Include: title, background, learning objectives, numbered tasks,
+submission format, and a marking rubric."""
         result = ask_gemini(prompt)
-        ctx.setdefault("outputs", {})["Graded Quiz"] = result
-        return f"{count}-question quiz generated. Stored as 'Graded Quiz'."
+        ctx.setdefault("outputs", {})["Assignment"] = result
+        return f"Assignment generated ({len(result)} chars). Stored as 'Assignment'."
+
+    if name == "generate_question_paper":
+        subject = args.get("subject", "")
+        topics = args.get("topics", "")
+        count = args.get("count", 10)
+        marks = args.get("marks", 5)
+        prompt = f"""You are an expert examination-paper designer. Create a
+professional question paper.
+Subject: {subject}
+Topics/Units: {topics}
+Number of Questions: {count}
+Marks per Question: {marks}
+Education Level: {ctx.get('education_level')}
+Language: {ctx.get('language')}
+Number every question and format it like a real examination paper."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Question Paper"] = result
+        return f"Question paper generated ({len(result)} chars). Stored as 'Question Paper'."
+
+    if name == "generate_teaching_material":
+        subject = args.get("subject", "")
+        topic = args.get("topic", "the topic")
+        material_type = args.get("material_type", "Lecture Notes")
+        prompt = f"""You are an expert teacher and academic-content designer.
+Create {material_type} for the topic "{topic}".
+Subject: {subject}
+Education Level: {ctx.get('education_level')}
+Language: {ctx.get('language')}
+Make it classroom-ready with definitions, examples, and a summary."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Teaching Material"] = result
+        return f"Teaching material generated ({len(result)} chars). Stored as 'Teaching Material'."
+
+    if name == "ask_clarifying_question":
+        # Normally intercepted by the loop before reaching dispatch; this
+        # is a defensive fallback only.
+        return "Waiting for the teacher's answer."
 
     return f"Unknown tool: {name}"
 
 
-def run_agent(goal: str, ctx: dict, log=print):
-    """
-    The actual agent loop. Gemini decides which tool to call and with
-    what arguments, sees the result, and decides the NEXT action -- until
-    it decides the goal is satisfied (no more function calls) or the
-    safety cap is hit.
-    """
+# ------------------------------------------------------------
+# The agent loop
+# ------------------------------------------------------------
+#
+# Supports two things a single-call-at-a-time loop can't:
+#   1. PARALLEL tool calls — if Gemini returns more than one function
+#      call in a single turn, all of them are executed and their results
+#      are sent back together in one message, instead of one round trip
+#      per tool.
+#   2. PAUSING for a clarifying question — the loop can hand control back
+#      to the teacher mid-run instead of guessing, then resume exactly
+#      where it left off once an answer is provided. This is why the
+#      loop is split into start/continue instead of one blocking call:
+#      Streamlit reruns the whole script on every interaction, so the
+#      live `chat` session has to be handed back to the caller to stash
+#      in st.session_state rather than looped over internally.
+
+def _extract_function_calls(response):
+    candidate = response.candidates[0]
+    return [part.function_call for part in candidate.content.parts if part.function_call]
+
+
+def _final_text_from_response(response):
+    candidate = response.candidates[0]
+    return "".join(part.text for part in candidate.content.parts if part.text)
+
+
+def _drive_agent_loop(chat, response, ctx, log, step):
+
+    while step < AGENT_MAX_STEPS:
+        step += 1
+
+        calls = _extract_function_calls(response)
+
+        if not calls:
+            final_text = _final_text_from_response(response)
+            log(f"**Step {step}:** Agent finished — no further actions needed.")
+            return {
+                "status": "done",
+                "chat": chat,
+                "final_text": final_text,
+                "step": step,
+            }
+
+        clarifying = next(
+            (c for c in calls if c.name == "ask_clarifying_question"), None
+        )
+
+        if clarifying is not None:
+            question = dict(clarifying.args).get("question", "Could you clarify the goal?")
+            log(f"**Step {step}:** Agent needs clarification: {question}")
+            return {
+                "status": "needs_input",
+                "chat": chat,
+                "pending_question": question,
+                "pending_call_name": clarifying.name,
+                "step": step,
+            }
+
+        response_parts = []
+
+        for call in calls:
+            args = dict(call.args)
+            log(f"**Step {step}:** Agent calls `{call.name}({args})`")
+
+            result = execute_agent_tool(call.name, args, ctx)
+            log(f"**Step {step} result ({call.name}):** {result}")
+
+            response_parts.append(
+                genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name=call.name,
+                        response={"result": result},
+                    )
+                )
+            )
+
+        try:
+            response = chat.send_message(genai.protos.Content(parts=response_parts))
+        except Exception as e:
+            log(f"Agent API error: {e}")
+            return {"status": "error", "chat": chat, "step": step}
+
+    log("**Stopped:** hit the safety cap on steps.")
+    final_text = _final_text_from_response(response)
+    return {"status": "done", "chat": chat, "final_text": final_text, "step": step}
+
+
+def start_agent(goal: str, ctx: dict, log=print):
+    """Starts a new agent chat and runs it until it finishes, needs a
+    clarifying answer, or errors. Returns a state dict to stash in
+    st.session_state."""
 
     if agent_model is None:
         log("Agent Mode is not available: Gemini API key not configured.")
-        return "Agent Mode is not available: Gemini API key not configured.", {}
+        return {"status": "error", "chat": None}
 
     chat = agent_model.start_chat()
-    step = 0
 
     try:
         response = chat.send_message(goal)
     except Exception as e:
         log(f"Agent API error: {e}")
-        return f"Agent API error: {e}", ctx.get("outputs", {})
+        return {"status": "error", "chat": None}
 
-    while step < AGENT_MAX_STEPS:
-        step += 1
+    return _drive_agent_loop(chat, response, ctx, log, step=0)
 
-        candidate = response.candidates[0]
-        function_calls = [
-            part.function_call
-            for part in candidate.content.parts
-            if part.function_call
-        ]
 
-        if not function_calls:
-            final_text = "".join(
-                part.text for part in candidate.content.parts if part.text
+def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: dict, log=print, step: int = 0):
+    """Resumes a paused agent after the teacher answers a clarifying
+    question, continuing from exactly where it left off."""
+
+    try:
+        response = chat.send_message(
+            genai.protos.Content(
+                parts=[genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name=pending_call_name,
+                        response={"result": answer},
+                    )
+                )]
             )
-            log(f"**Step {step}:** Agent finished — no further actions needed.")
-            return final_text, ctx.get("outputs", {})
+        )
+    except Exception as e:
+        log(f"Agent API error: {e}")
+        return {"status": "error", "chat": chat, "step": step}
 
-        call = function_calls[0]
-        args = dict(call.args)
-        log(f"**Step {step}:** Agent calls `{call.name}({args})`")
-
-        result = execute_agent_tool(call.name, args, ctx)
-        log(f"**Step {step} result:** {result}")
-
-        try:
-            response = chat.send_message(
-                genai.protos.Content(
-                    parts=[genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=call.name,
-                            response={"result": result},
-                        )
-                    )]
-                )
-            )
-        except Exception as e:
-            log(f"Agent API error: {e}")
-            return f"Agent API error: {e}", ctx.get("outputs", {})
-
-    log("**Stopped:** hit the safety cap on steps.")
-    final_text = "".join(
-        part.text for part in response.candidates[0].content.parts if part.text
-    )
-    return final_text, ctx.get("outputs", {})
+    return _drive_agent_loop(chat, response, ctx, log, step=step)
 
 
 # ============================================================
@@ -765,6 +1131,14 @@ _DEFAULT_STATE = {
     "pdf_qa_response": "",
     "agent_final_summary": "",
     "agent_outputs": {},
+    "agent_log": [],
+    "agent_chat": None,
+    "agent_step": 0,
+    "agent_pending_question": "",
+    "agent_pending_call_name": "",
+    "agent_quiz_questions": [],
+    "agent_quiz_answers": {},
+    "agent_quiz_score": None,
 }
 
 for _key, _default in _DEFAULT_STATE.items():
@@ -1766,20 +2140,29 @@ Instructions:
 
         st.write(
             "Describe a goal instead of picking a tool. The agent decides "
-            "which of the actions below to use, in what order, and with "
-            "what arguments — checking student risk data and lesson "
-            "material along the way if it decides that's useful."
+            "which actions to use, in what order, whether to run several "
+            "at once, and — if the goal is genuinely unclear — it will "
+            "ask you instead of guessing."
         )
 
         with st.expander("What can the agent do on its own?"):
             st.markdown(
                 "- Check the uploaded student CSV for at-risk students\n"
+                "- Run a deeper class-performance analysis (averages, "
+                "gaps between at-risk and class-wide numbers)\n"
                 "- Read the previously uploaded lesson PDF\n"
                 "- Generate a lesson plan\n"
                 "- Generate practice MCQs\n"
-                "- Generate a graded quiz\n\n"
-                "It chooses which of these to call, in what order, and "
-                "with what arguments — you only state the goal."
+                "- Generate a graded quiz (takeable right here, not just "
+                "a text dump)\n"
+                "- Generate a full assignment\n"
+                "- Generate a formal question paper\n"
+                "- Generate other teaching material (notes, handouts, "
+                "case studies, revision sheets)\n"
+                "- Ask you a clarifying question if it genuinely can't "
+                "tell what you want\n\n"
+                "It can call several of these in the same step when they "
+                "don't depend on each other, instead of one at a time."
             )
 
         agent_goal = st.text_area(
@@ -1792,20 +2175,45 @@ Instructions:
             key="agent_goal"
         )
 
+        def _make_agent_logger():
+            log_lines = list(st.session_state.get("agent_log", []))
+            log_area = st.empty()
+            log_area.markdown("\n\n".join(log_lines) if log_lines else "")
+
+            def _log(msg):
+                log_lines.append(msg)
+                st.session_state.agent_log = log_lines
+                log_area.markdown("\n\n".join(log_lines))
+
+            return _log
+
+        run_disabled = agent_model is None
+
+        if run_disabled:
+            st.error(
+                "Agent Mode needs GEMINI_API_KEY configured in "
+                "Streamlit secrets."
+            )
+
         if st.button(
             "🚀 Run Agent",
             key="run_agent_button",
-            use_container_width=True
+            use_container_width=True,
+            disabled=run_disabled,
         ):
 
             if not agent_goal.strip():
                 st.warning("Please describe a goal for the agent.")
-            elif agent_model is None:
-                st.error(
-                    "Agent Mode needs GEMINI_API_KEY configured in "
-                    "Streamlit secrets."
-                )
             else:
+
+                st.session_state.agent_log = []
+                st.session_state.agent_final_summary = ""
+                st.session_state.agent_outputs = {}
+                st.session_state.agent_quiz_questions = []
+                st.session_state.agent_quiz_answers = {}
+                st.session_state.agent_quiz_score = None
+                st.session_state.agent_pending_question = ""
+                st.session_state.agent_pending_call_name = ""
 
                 ctx = {
                     "pdf_text": st.session_state.get("pdf_text", ""),
@@ -1815,20 +2223,99 @@ Instructions:
                     "outputs": {},
                 }
 
-                log_lines = []
-                log_area = st.empty()
-
-                def _agent_log(msg):
-                    log_lines.append(msg)
-                    log_area.markdown("\n\n".join(log_lines))
+                log = _make_agent_logger()
 
                 with st.spinner("Agent is planning and acting..."):
-                    final_text, outputs = run_agent(
-                        agent_goal, ctx, log=_agent_log
+                    state = start_agent(agent_goal, ctx, log=log)
+
+                st.session_state.agent_chat = state.get("chat")
+                st.session_state.agent_step = state.get("step", 0)
+                st.session_state.agent_outputs = ctx.get("outputs", {})
+
+                if state["status"] == "needs_input":
+                    st.session_state.agent_pending_question = state["pending_question"]
+                    st.session_state.agent_pending_call_name = state["pending_call_name"]
+                elif state["status"] == "done":
+                    st.session_state.agent_final_summary = state["final_text"]
+                    if ctx.get("quiz_questions"):
+                        st.session_state.agent_quiz_questions = ctx["quiz_questions"]
+                else:
+                    st.session_state.agent_final_summary = (
+                        "The agent stopped early due to an error — see the log above."
                     )
 
-                st.session_state.agent_final_summary = final_text
-                st.session_state.agent_outputs = outputs
+                st.rerun()
+
+        # --------------------------------------------------------
+        # Clarifying-question pause/resume
+        # --------------------------------------------------------
+
+        if st.session_state.get("agent_pending_question"):
+
+            st.markdown("---")
+            st.info(
+                f"🤔 **Agent needs clarification:** "
+                f"{st.session_state.agent_pending_question}"
+            )
+
+            clarifying_answer = st.text_input(
+                "Your answer",
+                key="agent_clarifying_answer"
+            )
+
+            if st.button(
+                "↩️ Send Answer & Continue",
+                key="agent_send_answer",
+                use_container_width=True
+            ):
+
+                if not clarifying_answer.strip():
+                    st.warning("Please enter an answer.")
+                else:
+
+                    ctx = {
+                        "pdf_text": st.session_state.get("pdf_text", ""),
+                        "student_df": st.session_state.get("uploaded_student_data"),
+                        "education_level": education_level,
+                        "language": response_language,
+                        "outputs": st.session_state.get("agent_outputs", {}),
+                    }
+
+                    log = _make_agent_logger()
+
+                    with st.spinner("Agent is continuing..."):
+                        state = continue_agent_with_answer(
+                            st.session_state.agent_chat,
+                            st.session_state.agent_pending_call_name,
+                            clarifying_answer,
+                            ctx,
+                            log=log,
+                            step=st.session_state.get("agent_step", 0),
+                        )
+
+                    st.session_state.agent_chat = state.get("chat")
+                    st.session_state.agent_step = state.get("step", 0)
+                    st.session_state.agent_outputs = ctx.get("outputs", {})
+                    st.session_state.agent_pending_question = ""
+                    st.session_state.agent_pending_call_name = ""
+
+                    if state["status"] == "needs_input":
+                        st.session_state.agent_pending_question = state["pending_question"]
+                        st.session_state.agent_pending_call_name = state["pending_call_name"]
+                    elif state["status"] == "done":
+                        st.session_state.agent_final_summary = state["final_text"]
+                        if ctx.get("quiz_questions"):
+                            st.session_state.agent_quiz_questions = ctx["quiz_questions"]
+                    else:
+                        st.session_state.agent_final_summary = (
+                            "The agent stopped early due to an error — see the log above."
+                        )
+
+                    st.rerun()
+
+        # --------------------------------------------------------
+        # Final summary + generated artifacts
+        # --------------------------------------------------------
 
         if st.session_state.get("agent_final_summary"):
 
@@ -1841,7 +2328,15 @@ Instructions:
             for artifact_name, artifact_content in outputs.items():
 
                 st.subheader(artifact_name)
-                st.markdown(artifact_content)
+
+                if artifact_name in ("Practice MCQs", "Graded Quiz"):
+                    st.caption(
+                        "Raw generated JSON — see the interactive quiz "
+                        "below if this is the graded quiz."
+                    )
+                    st.code(artifact_content, language="json")
+                else:
+                    st.markdown(artifact_content)
 
                 render_pdf_download_button(
                     artifact_content,
@@ -1849,6 +2344,74 @@ Instructions:
                     filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
                     key=f"pdf_download_agent_{artifact_name}",
                 )
+
+            # ----------------------------------------------------
+            # Interactive quiz — the agent's JSON gets rendered as
+            # a real, takeable quiz instead of a text dump.
+            # ----------------------------------------------------
+
+            if st.session_state.get("agent_quiz_questions"):
+
+                st.markdown("---")
+                st.subheader("🎯 Take the Agent-Generated Quiz")
+
+                questions = st.session_state.agent_quiz_questions
+
+                for index, item in enumerate(questions):
+
+                    options = item.get("options", [])
+                    if len(options) != 4:
+                        continue
+
+                    selected = st.radio(
+                        f"{index + 1}. {item.get('question', '')}",
+                        options,
+                        key=f"agent_quiz_answer_{index}"
+                    )
+                    st.session_state.agent_quiz_answers[index] = selected
+
+                if st.button(
+                    "✅ Submit Quiz",
+                    key="agent_submit_quiz",
+                    use_container_width=True
+                ):
+
+                    score = 0
+                    for index, item in enumerate(questions):
+                        options = item.get("options", [])
+                        correct_index = item.get("answer")
+
+                        if (
+                            index in st.session_state.agent_quiz_answers
+                            and isinstance(correct_index, int)
+                            and 0 <= correct_index < len(options)
+                            and st.session_state.agent_quiz_answers[index] == options[correct_index]
+                        ):
+                            score += 1
+
+                    st.session_state.agent_quiz_score = score
+
+                if st.session_state.get("agent_quiz_score") is not None:
+
+                    total = len(questions)
+                    score = st.session_state.agent_quiz_score
+                    percentage = round((score / total) * 100, 1) if total else 0
+
+                    st.success(f"🎉 Score: {score}/{total} ({percentage}%)")
+
+                    for index, item in enumerate(questions):
+                        options = item.get("options", [])
+                        correct_index = item.get("answer")
+
+                        if isinstance(correct_index, int) and 0 <= correct_index < len(options):
+                            correct_option = options[correct_index]
+
+                            if st.session_state.agent_quiz_answers.get(index) == correct_option:
+                                st.success(f"Q{index + 1}: Correct")
+                            else:
+                                st.error(f"Q{index + 1}: Incorrect. Correct answer: {correct_option}")
+
+                            st.caption(item.get("explanation", "No explanation provided."))
 
 
 # ============================================================
