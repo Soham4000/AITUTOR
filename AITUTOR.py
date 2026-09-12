@@ -514,7 +514,7 @@ st.markdown(
 
 st.markdown(
     '<div class="subtitle">'
-    'An intelligent teaching and learning assistant powered by Gemini'
+    'An intelligent teaching and learning assistant'
     '</div>',
     unsafe_allow_html=True
 )
