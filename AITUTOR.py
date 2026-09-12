@@ -88,14 +88,19 @@ model = configure_gemini()
 # done — based on a natural-language goal instead of a button click.
 
 AGENT_SYSTEM_INSTRUCTION = """You are an autonomous teaching-prep agent \
-embedded in a teacher's classroom-prep tool.
+embedded in a teacher's classroom-prep tool. This is an ongoing chat — the \
+teacher may send you a new request at any point, including after you've \
+already completed earlier ones. Treat each new request from the teacher as \
+a fresh goal to plan for, while remembering everything already produced \
+earlier in the conversation.
 
 Guidelines:
-- Your VERY FIRST action, before calling any other tool, MUST be
-  present_plan: list the concrete steps (and which tools you intend to
-  call for each) that you plan to take to satisfy the goal. Call it
-  ALONE. Wait for the teacher's approval before taking any other action.
-- After the plan is approved, break the goal into the smallest set of
+- For EVERY new request the teacher sends (the very first one, and any
+  follow-up), your first action in response MUST be present_plan: list
+  the concrete steps (and which tools you intend to call for each) that
+  you plan to take. Call it ALONE. Wait for the teacher's approval
+  before taking any other action for that request.
+- After a plan is approved, break that request into the smallest set of
   concrete actions needed to satisfy it.
 - Call multiple independent tools in the SAME turn when their results
   don't depend on each other (for example, practice MCQs and a graded
@@ -103,16 +108,19 @@ Guidelines:
   Sequence tools that genuinely depend on each other's output (for
   example, check student data or read lesson material BEFORE deciding
   what a lesson plan should emphasize).
-- Only call ask_clarifying_question when the goal is genuinely
+- Only call ask_clarifying_question when a request is genuinely
   ambiguous or missing information you cannot reasonably infer (for
   example, no subject or topic given at all). Call it ALONE, never
   combined with other tool calls, and only once per genuine gap.
   Prefer acting on a sensible default over asking. If you need to ask a
   clarifying question, it may come either before or after the plan, but
-  present_plan must still be your first call overall.
-- When every needed artifact has been produced, respond with a concise
-  plain-text summary of what you made and why, with no further tool
-  calls.
+  present_plan must still be your first call for that request.
+- A follow-up request may reference or build on artifacts you already
+  produced earlier in this conversation (e.g. "make that quiz harder",
+  "also add a case study") — use that context instead of starting over.
+- When every needed artifact for the CURRENT request has been produced,
+  respond with a concise plain-text summary of what you made and why,
+  with no further tool calls.
 """
 
 AGENT_TOOLS = [
@@ -793,31 +801,42 @@ do NOT call any tools."""
     return _drive_agent_loop(chat, response, ctx, log, step=step)
 
 
-def start_agent(goal: str, ctx: dict, log=print):
-    """Starts a new agent chat and runs it until it finishes, needs a
-    plan approval or clarifying answer, or errors. Returns a state dict
-    to stash in st.session_state."""
+def send_agent_message(chat, message: str, ctx: dict, log=print, step: int = 0):
+    """
+    Sends a message on the agent's chat — starting a brand-new chat if
+    `chat` is None, or continuing an already-open one otherwise. This is
+    what makes the agent genuinely interactive: a follow-up like "also
+    make a quiz" or "make that harder" reuses the SAME conversation, so
+    the model still remembers everything produced earlier, instead of
+    starting cold every time.
+    """
 
     if agent_model is None:
         log("Agent Mode is not available: Gemini API key not configured.")
         return {"status": "error", "chat": None}
 
-    ctx["goal"] = goal  # kept for the self-review pass, even across pauses
+    ctx["goal"] = message  # used by the self-review pass for this request
 
-    chat = agent_model.start_chat()
+    if chat is None:
+        chat = agent_model.start_chat()
 
     try:
-        response = chat.send_message(goal)
+        response = chat.send_message(message)
     except Exception as e:
         log(f"Agent API error: {e}")
-        return {"status": "error", "chat": None}
+        return {"status": "error", "chat": chat, "step": step}
 
-    state = _drive_agent_loop(chat, response, ctx, log, step=0)
+    state = _drive_agent_loop(chat, response, ctx, log, step=step)
 
     if state["status"] == "done":
-        state = run_self_review(chat, ctx, log, state["step"], goal)
+        state = run_self_review(chat, ctx, log, state["step"], message)
 
     return state
+
+
+def start_agent(goal: str, ctx: dict, log=print):
+    """Back-compat wrapper: starts a brand-new agent chat."""
+    return send_agent_message(None, goal, ctx, log=log, step=0)
 
 
 def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: dict, log=print, step: int = 0):
@@ -1267,9 +1286,8 @@ _DEFAULT_STATE = {
     "student_analysis_response": "",
     "uploaded_student_data": None,
     "pdf_qa_response": "",
-    "agent_final_summary": "",
+    "agent_conversation": [],
     "agent_outputs": {},
-    "agent_log": [],
     "agent_chat": None,
     "agent_step": 0,
     "agent_pending_question": "",
@@ -2278,18 +2296,19 @@ Instructions:
         st.header("🤖 Autonomous Course Prep Agent")
 
         st.write(
-            "Describe a goal instead of picking a tool. The agent plans "
-            "its approach and waits for your approval, decides which "
-            "actions to use and whether to run several at once, asks you "
-            "instead of guessing when the goal is unclear, and "
-            "double-checks its own work against your goal before calling "
-            "itself done."
+            "Chat with the agent instead of filling a form. It remembers "
+            "everything produced earlier in this conversation, so you can "
+            "send follow-ups like *\"also make a quiz\"* or *\"make that "
+            "harder\"* and it'll build on what's already there — planning "
+            "each new request and waiting for your approval before acting, "
+            "asking you when something's genuinely unclear, and "
+            "double-checking its own work before calling itself done."
         )
 
         with st.expander("What can the agent do on its own?"):
             st.markdown(
-                "- 📋 Propose a plan and wait for your approval before "
-                "doing anything\n"
+                "- 📋 Propose a plan for each new request and wait for "
+                "your approval before doing anything\n"
                 "- 📊 Check the uploaded student CSV for at-risk students\n"
                 "- 📈 Run a deeper class-performance analysis (averages, "
                 "gaps between at-risk and class-wide numbers)\n"
@@ -2304,49 +2323,58 @@ Instructions:
                 "case studies, revision sheets)\n"
                 "- ❓ Ask you a clarifying question if it genuinely can't "
                 "tell what you want\n"
-                "- 🔍 Review its own output against your goal before "
+                "- 🔍 Review its own output against your request before "
                 "finishing, and fix gaps it finds\n\n"
                 "It can call several of these in the same step when they "
-                "don't depend on each other, instead of one at a time."
+                "don't depend on each other, instead of one at a time — "
+                "and it keeps the whole conversation in memory, so later "
+                "requests can build on earlier artifacts."
             )
 
-        agent_goal = st.text_area(
-            "Describe what you want prepared",
-            placeholder=(
-                "Example: Prepare my class for next week's midterm on "
-                "Chapter 5: Neural Networks"
-            ),
-            height=100,
-            key="agent_goal"
-        )
+        # ----------------------------------------------------------------
+        # Shared helpers for this tab
+        # ----------------------------------------------------------------
 
-        def _make_agent_logger(label="🤖 Agent is working..."):
-            log_lines = list(st.session_state.get("agent_log", []))
+        def _agent_build_ctx():
+            return {
+                "pdf_text": st.session_state.get("pdf_text", ""),
+                "student_df": st.session_state.get("uploaded_student_data"),
+                "education_level": education_level,
+                "language": response_language,
+                # Carry forward everything produced so far in this
+                # conversation, so a follow-up turn adds to it instead of
+                # wiping it out.
+                "outputs": dict(st.session_state.get("agent_outputs", {})),
+            }
+
+        def _agent_new_turn_logger(label):
+            """Same live st.status() treatment as before, but scoped to a
+            single conversation turn's own step list, so each turn in the
+            history keeps its own trace instead of one giant shared log."""
+            turn_log_lines = []
             status_box = st.status(label, expanded=True)
             log_area = status_box.empty()
-            log_area.markdown("\n\n".join(log_lines) if log_lines else "_Starting up..._")
+            log_area.markdown("_Starting up..._")
 
             def _log(msg):
-                log_lines.append(msg)
-                st.session_state.agent_log = log_lines
-                log_area.markdown("\n\n".join(log_lines))
+                turn_log_lines.append(msg)
+                log_area.markdown("\n\n".join(turn_log_lines))
 
-            return _log, status_box
+            return _log, status_box, turn_log_lines
 
-        def _finish_status(status_box, state):
+        def _agent_finish_status(status_box, state):
             if state["status"] == "done":
-                status_box.update(label="✅ Agent finished", state="complete")
+                status_box.update(label="✅ Done", state="complete")
             elif state["status"] == "plan_ready":
                 status_box.update(label="📋 Waiting for plan approval", state="complete")
             elif state["status"] == "needs_input":
                 status_box.update(label="❓ Waiting for your answer", state="complete")
             else:
-                status_box.update(label="⚠️ Agent stopped early", state="error")
+                status_box.update(label="⚠️ Stopped early", state="error")
 
-        def _apply_agent_state(state, ctx):
-            """Common bookkeeping after start_agent()/continue_agent_with_answer()
-            returns — handles all three possible outcomes: it paused for a
-            plan approval, paused for a clarifying answer, or finished."""
+        def _agent_apply_state(state, ctx, steps_this_turn):
+            """Updates session state after any agent call and returns the
+            assistant turn record to append to the visible conversation."""
 
             st.session_state.agent_chat = state.get("chat")
             st.session_state.agent_step = state.get("step", 0)
@@ -2356,42 +2384,307 @@ Instructions:
             st.session_state.agent_pending_call_name = ""
             st.session_state.agent_pending_plan_steps = []
 
+            new_outputs = {}
+
             if state["status"] == "plan_ready":
                 st.session_state.agent_pending_plan_steps = state["plan_steps"]
                 st.session_state.agent_pending_call_name = state["pending_call_name"]
+                turn = {
+                    "role": "assistant",
+                    "kind": "plan",
+                    "plan_steps": state["plan_steps"],
+                    "steps": steps_this_turn,
+                }
             elif state["status"] == "needs_input":
                 st.session_state.agent_pending_question = state["pending_question"]
                 st.session_state.agent_pending_call_name = state["pending_call_name"]
+                turn = {
+                    "role": "assistant",
+                    "kind": "clarify",
+                    "question": state["pending_question"],
+                    "steps": steps_this_turn,
+                }
             elif state["status"] == "done":
-                st.session_state.agent_final_summary = state["final_text"]
                 if ctx.get("quiz_questions"):
                     st.session_state.agent_quiz_questions = ctx["quiz_questions"]
+                turn = {
+                    "role": "assistant",
+                    "kind": "done",
+                    "content": state["final_text"],
+                    "steps": steps_this_turn,
+                    "outputs": dict(ctx.get("outputs", {})),
+                }
             else:
-                st.session_state.agent_final_summary = (
-                    "The agent stopped early due to an error — see the log above."
+                turn = {
+                    "role": "assistant",
+                    "kind": "error",
+                    "content": "The agent stopped early due to an error — see the steps above.",
+                    "steps": steps_this_turn,
+                }
+
+            return turn
+
+        def _render_artifact(artifact_name, artifact_content, key_suffix):
+            st.markdown(f"**{artifact_name}**")
+            if artifact_name in ("Practice MCQs", "Graded Quiz"):
+                st.caption(
+                    "Raw generated JSON — see the interactive quiz below "
+                    "if this is the graded quiz."
                 )
+                st.code(artifact_content, language="json")
+            else:
+                st.markdown(artifact_content)
 
-        run_disabled = agent_model is None
-
-        if run_disabled:
-            st.error(
-                "Agent Mode needs GEMINI_API_KEY configured in "
-                "Streamlit secrets."
+            render_pdf_download_button(
+                artifact_content,
+                title=artifact_name,
+                filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
+                key=f"pdf_download_agent_{key_suffix}_{artifact_name}",
             )
 
-        if st.button(
-            "🚀 Run Agent",
-            key="run_agent_button",
-            use_container_width=True,
-            disabled=run_disabled,
-        ):
+        # ----------------------------------------------------------------
+        # Conversation history — every past exchange, replayed on every
+        # rerun so the chat looks and behaves like a normal chat thread.
+        # ----------------------------------------------------------------
 
-            if not agent_goal.strip():
-                st.warning("Please describe a goal for the agent.")
-            else:
+        for turn_index, turn in enumerate(st.session_state.get("agent_conversation", [])):
 
-                st.session_state.agent_log = []
-                st.session_state.agent_final_summary = ""
+            if turn["role"] == "user":
+                with st.chat_message("user"):
+                    st.markdown(turn["content"])
+                continue
+
+            with st.chat_message("assistant"):
+
+                if turn.get("steps"):
+                    with st.expander("🛠️ Steps taken", expanded=False):
+                        st.markdown("\n\n".join(turn["steps"]))
+
+                if turn["kind"] == "plan":
+                    st.info("📋 **Proposed a plan:**")
+                    for s in turn["plan_steps"]:
+                        st.markdown(f"- {s}")
+                    st.caption(
+                        "(This was the plan at the time — see below if "
+                        "it's still awaiting your approval.)"
+                    )
+
+                elif turn["kind"] == "clarify":
+                    st.info(f"🤔 **Asked:** {turn['question']}")
+
+                elif turn["kind"] == "error":
+                    st.error(turn["content"])
+
+                else:  # done
+                    st.success(turn["content"])
+                    for artifact_name, artifact_content in turn.get("outputs", {}).items():
+                        _render_artifact(artifact_name, artifact_content, key_suffix=f"hist{turn_index}")
+
+        # ----------------------------------------------------------------
+        # Pending plan approval / clarifying question — always rendered
+        # as the latest assistant turn, with live controls attached.
+        # ----------------------------------------------------------------
+
+        if st.session_state.get("agent_pending_plan_steps"):
+
+            with st.chat_message("assistant"):
+                st.info("📋 **Proposed plan — approve to run it:**")
+                for s in st.session_state.agent_pending_plan_steps:
+                    st.markdown(f"- {s}")
+
+                col_approve, col_cancel = st.columns(2)
+                with col_approve:
+                    approve_clicked = st.button(
+                        "▶️ Approve & Run", key="agent_approve_plan", use_container_width=True
+                    )
+                with col_cancel:
+                    cancel_clicked = st.button(
+                        "✖️ Cancel", key="agent_cancel_plan", use_container_width=True
+                    )
+
+                if cancel_clicked:
+                    st.session_state.agent_conversation.append({
+                        "role": "assistant",
+                        "kind": "error",
+                        "content": "Run cancelled before execution.",
+                        "steps": [],
+                    })
+                    st.session_state.agent_pending_plan_steps = []
+                    st.session_state.agent_pending_call_name = ""
+                    st.rerun()
+
+                if approve_clicked:
+                    ctx = _agent_build_ctx()
+                    log, status_box, steps_this_turn = _agent_new_turn_logger(
+                        "🤖 Executing the approved plan..."
+                    )
+                    state = continue_agent_with_answer(
+                        st.session_state.agent_chat,
+                        st.session_state.agent_pending_call_name,
+                        "Approved. Proceed with the plan.",
+                        ctx,
+                        log=log,
+                        step=st.session_state.get("agent_step", 0),
+                    )
+                    turn = _agent_apply_state(state, ctx, steps_this_turn)
+                    _agent_finish_status(status_box, state)
+                    st.session_state.agent_conversation.append(turn)
+                    st.rerun()
+
+        elif st.session_state.get("agent_pending_question"):
+
+            with st.chat_message("assistant"):
+                st.info(f"🤔 **Needs clarification:** {st.session_state.agent_pending_question}")
+
+                clarifying_answer = st.text_input("Your answer", key="agent_clarifying_answer")
+
+                if st.button("↩️ Send Answer", key="agent_send_answer", use_container_width=True):
+                    if not clarifying_answer.strip():
+                        st.warning("Please enter an answer.")
+                    else:
+                        st.session_state.agent_conversation.append({
+                            "role": "user", "content": clarifying_answer
+                        })
+                        ctx = _agent_build_ctx()
+                        log, status_box, steps_this_turn = _agent_new_turn_logger(
+                            "🤖 Continuing..."
+                        )
+                        state = continue_agent_with_answer(
+                            st.session_state.agent_chat,
+                            st.session_state.agent_pending_call_name,
+                            clarifying_answer,
+                            ctx,
+                            log=log,
+                            step=st.session_state.get("agent_step", 0),
+                        )
+                        turn = _agent_apply_state(state, ctx, steps_this_turn)
+                        _agent_finish_status(status_box, state)
+                        st.session_state.agent_conversation.append(turn)
+                        st.rerun()
+
+        # ----------------------------------------------------------------
+        # New message input — disabled while a plan/question is pending,
+        # since those have their own controls above.
+        # ----------------------------------------------------------------
+
+        awaiting_response = bool(
+            st.session_state.get("agent_pending_plan_steps")
+            or st.session_state.get("agent_pending_question")
+        )
+
+        new_message = st.chat_input(
+            "Ask the agent to prepare something, or send a follow-up...",
+            disabled=(agent_model is None or awaiting_response),
+        )
+
+        if agent_model is None:
+            st.error("Agent Mode needs GEMINI_API_KEY configured in Streamlit secrets.")
+
+        if new_message:
+            st.session_state.agent_conversation.append({"role": "user", "content": new_message})
+
+            with st.chat_message("user"):
+                st.markdown(new_message)
+
+            ctx = _agent_build_ctx()
+            log, status_box, steps_this_turn = _agent_new_turn_logger("🤖 Working on it...")
+
+            state = send_agent_message(
+                st.session_state.get("agent_chat"),
+                new_message,
+                ctx,
+                log=log,
+                step=0,
+            )
+
+            turn = _agent_apply_state(state, ctx, steps_this_turn)
+            _agent_finish_status(status_box, state)
+            st.session_state.agent_conversation.append(turn)
+            st.rerun()
+
+        # ----------------------------------------------------------------
+        # Conversation-level extras: metrics, course pack, interactive quiz
+        # ----------------------------------------------------------------
+
+        if st.session_state.get("agent_outputs"):
+
+            st.markdown("---")
+
+            metric_cols = st.columns(3)
+            with metric_cols[0]:
+                st.metric("Artifacts produced", len(st.session_state.agent_outputs))
+            with metric_cols[1]:
+                st.metric("Steps taken (total)", st.session_state.get("agent_step", 0))
+            with metric_cols[2]:
+                st.metric(
+                    "Interactive quiz",
+                    "Ready" if st.session_state.get("agent_quiz_questions") else "—"
+                )
+
+            try:
+                pack_bytes = generate_pdf_bytes(
+                    build_course_pack_text(st.session_state.agent_outputs),
+                    title="Course Prep Pack",
+                )
+                st.download_button(
+                    label="📦 Download Full Course Pack (all artifacts, one PDF)",
+                    data=pack_bytes,
+                    file_name="course_pack.pdf",
+                    mime="application/pdf",
+                    key="pdf_download_agent_course_pack",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Could not prepare the combined course pack: {e}")
+
+            # Conversation export/import — since Streamlit has no built-in
+            # persistent storage, this is how the chat survives beyond the
+            # current running session (a new session can reload it to see
+            # the transcript, though a fresh live agent chat starts if you
+            # send a new message).
+            export_col, import_col = st.columns(2)
+
+            with export_col:
+                try:
+                    import json as _json
+                    history_json = _json.dumps(
+                        st.session_state.agent_conversation, indent=2
+                    )
+                    st.download_button(
+                        "💾 Download Chat History (JSON)",
+                        data=history_json,
+                        file_name="agent_chat_history.json",
+                        mime="application/json",
+                        key="agent_history_download",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"Could not prepare chat history export: {e}")
+
+            with import_col:
+                uploaded_history = st.file_uploader(
+                    "📤 Load previous chat history",
+                    type=["json"],
+                    key="agent_history_upload",
+                    label_visibility="visible",
+                )
+                if uploaded_history is not None:
+                    try:
+                        import json as _json
+                        loaded = _json.loads(uploaded_history.read().decode("utf-8"))
+                        if isinstance(loaded, list):
+                            st.session_state.agent_conversation = loaded
+                            st.success("Chat history loaded. Scroll up to view it.")
+                            st.rerun()
+                        else:
+                            st.error("That file doesn't look like a saved agent chat history.")
+                    except Exception as e:
+                        st.error(f"Could not load that history file: {e}")
+
+            if st.button("🗑️ Clear Conversation", key="agent_clear_conversation"):
+                st.session_state.agent_conversation = []
+                st.session_state.agent_chat = None
+                st.session_state.agent_step = 0
                 st.session_state.agent_outputs = {}
                 st.session_state.agent_quiz_questions = []
                 st.session_state.agent_quiz_answers = {}
@@ -2399,259 +2692,63 @@ Instructions:
                 st.session_state.agent_pending_question = ""
                 st.session_state.agent_pending_call_name = ""
                 st.session_state.agent_pending_plan_steps = []
-
-                ctx = {
-                    "pdf_text": st.session_state.get("pdf_text", ""),
-                    "student_df": st.session_state.get("uploaded_student_data"),
-                    "education_level": education_level,
-                    "language": response_language,
-                    "outputs": {},
-                }
-
-                log, status_box = _make_agent_logger("🤖 Agent is planning and acting...")
-
-                state = start_agent(agent_goal, ctx, log=log)
-
-                _apply_agent_state(state, ctx)
-                _finish_status(status_box, state)
                 st.rerun()
 
-        # --------------------------------------------------------
-        # Plan approval pause/resume
-        # --------------------------------------------------------
+        # ----------------------------------------------------------------
+        # Interactive quiz — the agent's JSON gets rendered as a real,
+        # takeable quiz instead of a text dump.
+        # ----------------------------------------------------------------
 
-        if st.session_state.get("agent_pending_plan_steps"):
-
-            st.markdown("---")
-            st.info("📋 **Agent's proposed plan — approve to run it:**")
-            for s in st.session_state.agent_pending_plan_steps:
-                st.markdown(f"- {s}")
-
-            col_approve, col_cancel = st.columns(2)
-
-            with col_approve:
-                approve_clicked = st.button(
-                    "▶️ Approve & Run",
-                    key="agent_approve_plan",
-                    use_container_width=True
-                )
-
-            with col_cancel:
-                cancel_clicked = st.button(
-                    "✖️ Cancel",
-                    key="agent_cancel_plan",
-                    use_container_width=True
-                )
-
-            if cancel_clicked:
-                st.session_state.agent_pending_plan_steps = []
-                st.session_state.agent_pending_call_name = ""
-                st.session_state.agent_final_summary = "Run cancelled before execution."
-                st.rerun()
-
-            if approve_clicked:
-
-                ctx = {
-                    "pdf_text": st.session_state.get("pdf_text", ""),
-                    "student_df": st.session_state.get("uploaded_student_data"),
-                    "education_level": education_level,
-                    "language": response_language,
-                    "outputs": st.session_state.get("agent_outputs", {}),
-                    "goal": st.session_state.get("agent_goal", ""),
-                }
-
-                log, status_box = _make_agent_logger("🤖 Agent is executing the approved plan...")
-
-                state = continue_agent_with_answer(
-                    st.session_state.agent_chat,
-                    st.session_state.agent_pending_call_name,
-                    "Approved. Proceed with the plan.",
-                    ctx,
-                    log=log,
-                    step=st.session_state.get("agent_step", 0),
-                )
-
-                _apply_agent_state(state, ctx)
-                _finish_status(status_box, state)
-                st.rerun()
-
-        # --------------------------------------------------------
-        # Clarifying-question pause/resume
-        # --------------------------------------------------------
-
-        if st.session_state.get("agent_pending_question"):
+        if st.session_state.get("agent_quiz_questions"):
 
             st.markdown("---")
-            st.info(
-                f"🤔 **Agent needs clarification:** "
-                f"{st.session_state.agent_pending_question}"
-            )
+            st.subheader("🎯 Take the Agent-Generated Quiz")
 
-            clarifying_answer = st.text_input(
-                "Your answer",
-                key="agent_clarifying_answer"
-            )
+            questions = st.session_state.agent_quiz_questions
 
-            if st.button(
-                "↩️ Send Answer & Continue",
-                key="agent_send_answer",
-                use_container_width=True
-            ):
+            for index, item in enumerate(questions):
+                options = item.get("options", [])
+                if len(options) != 4:
+                    continue
 
-                if not clarifying_answer.strip():
-                    st.warning("Please enter an answer.")
-                else:
-
-                    ctx = {
-                        "pdf_text": st.session_state.get("pdf_text", ""),
-                        "student_df": st.session_state.get("uploaded_student_data"),
-                        "education_level": education_level,
-                        "language": response_language,
-                        "outputs": st.session_state.get("agent_outputs", {}),
-                        "goal": st.session_state.get("agent_goal", ""),
-                    }
-
-                    log, status_box = _make_agent_logger("🤖 Agent is continuing...")
-
-                    state = continue_agent_with_answer(
-                        st.session_state.agent_chat,
-                        st.session_state.agent_pending_call_name,
-                        clarifying_answer,
-                        ctx,
-                        log=log,
-                        step=st.session_state.get("agent_step", 0),
-                    )
-
-                    _apply_agent_state(state, ctx)
-                    _finish_status(status_box, state)
-                    st.rerun()
-
-        # --------------------------------------------------------
-        # Final summary + generated artifacts
-        # --------------------------------------------------------
-
-        if st.session_state.get("agent_final_summary"):
-
-            st.markdown("---")
-            st.success(st.session_state.agent_final_summary)
-
-            outputs = st.session_state.get("agent_outputs", {})
-
-            if outputs:
-                metric_cols = st.columns(3)
-                with metric_cols[0]:
-                    st.metric("Artifacts produced", len(outputs))
-                with metric_cols[1]:
-                    st.metric("Steps taken", st.session_state.get("agent_step", 0))
-                with metric_cols[2]:
-                    st.metric(
-                        "Interactive quiz",
-                        "Ready" if st.session_state.get("agent_quiz_questions") else "—"
-                    )
-
-                try:
-                    pack_bytes = generate_pdf_bytes(
-                        build_course_pack_text(outputs),
-                        title="Course Prep Pack",
-                    )
-                    st.download_button(
-                        label="📦 Download Full Course Pack (all artifacts, one PDF)",
-                        data=pack_bytes,
-                        file_name="course_pack.pdf",
-                        mime="application/pdf",
-                        key="pdf_download_agent_course_pack",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.warning(f"Could not prepare the combined course pack: {e}")
-
-            for artifact_name, artifact_content in outputs.items():
-
-                st.subheader(artifact_name)
-
-                if artifact_name in ("Practice MCQs", "Graded Quiz"):
-                    st.caption(
-                        "Raw generated JSON — see the interactive quiz "
-                        "below if this is the graded quiz."
-                    )
-                    st.code(artifact_content, language="json")
-                else:
-                    st.markdown(artifact_content)
-
-                render_pdf_download_button(
-                    artifact_content,
-                    title=artifact_name,
-                    filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
-                    key=f"pdf_download_agent_{artifact_name}",
+                selected = st.radio(
+                    f"{index + 1}. {item.get('question', '')}",
+                    options,
+                    key=f"agent_quiz_answer_{index}"
                 )
+                st.session_state.agent_quiz_answers[index] = selected
 
-            # ----------------------------------------------------
-            # Interactive quiz — the agent's JSON gets rendered as
-            # a real, takeable quiz instead of a text dump.
-            # ----------------------------------------------------
+            if st.button("✅ Submit Quiz", key="agent_submit_quiz", use_container_width=True):
+                score = 0
+                for index, item in enumerate(questions):
+                    options = item.get("options", [])
+                    correct_index = item.get("answer")
+                    if (
+                        index in st.session_state.agent_quiz_answers
+                        and isinstance(correct_index, int)
+                        and 0 <= correct_index < len(options)
+                        and st.session_state.agent_quiz_answers[index] == options[correct_index]
+                    ):
+                        score += 1
+                st.session_state.agent_quiz_score = score
 
-            if st.session_state.get("agent_quiz_questions"):
-
-                st.markdown("---")
-                st.subheader("🎯 Take the Agent-Generated Quiz")
-
-                questions = st.session_state.agent_quiz_questions
+            if st.session_state.get("agent_quiz_score") is not None:
+                total = len(questions)
+                score = st.session_state.agent_quiz_score
+                percentage = round((score / total) * 100, 1) if total else 0
+                st.success(f"🎉 Score: {score}/{total} ({percentage}%)")
 
                 for index, item in enumerate(questions):
-
                     options = item.get("options", [])
-                    if len(options) != 4:
-                        continue
+                    correct_index = item.get("answer")
+                    if isinstance(correct_index, int) and 0 <= correct_index < len(options):
+                        correct_option = options[correct_index]
+                        if st.session_state.agent_quiz_answers.get(index) == correct_option:
+                            st.success(f"Q{index + 1}: Correct")
+                        else:
+                            st.error(f"Q{index + 1}: Incorrect. Correct answer: {correct_option}")
+                        st.caption(item.get("explanation", "No explanation provided."))
 
-                    selected = st.radio(
-                        f"{index + 1}. {item.get('question', '')}",
-                        options,
-                        key=f"agent_quiz_answer_{index}"
-                    )
-                    st.session_state.agent_quiz_answers[index] = selected
-
-                if st.button(
-                    "✅ Submit Quiz",
-                    key="agent_submit_quiz",
-                    use_container_width=True
-                ):
-
-                    score = 0
-                    for index, item in enumerate(questions):
-                        options = item.get("options", [])
-                        correct_index = item.get("answer")
-
-                        if (
-                            index in st.session_state.agent_quiz_answers
-                            and isinstance(correct_index, int)
-                            and 0 <= correct_index < len(options)
-                            and st.session_state.agent_quiz_answers[index] == options[correct_index]
-                        ):
-                            score += 1
-
-                    st.session_state.agent_quiz_score = score
-
-                if st.session_state.get("agent_quiz_score") is not None:
-
-                    total = len(questions)
-                    score = st.session_state.agent_quiz_score
-                    percentage = round((score / total) * 100, 1) if total else 0
-
-                    st.success(f"🎉 Score: {score}/{total} ({percentage}%)")
-
-                    for index, item in enumerate(questions):
-                        options = item.get("options", [])
-                        correct_index = item.get("answer")
-
-                        if isinstance(correct_index, int) and 0 <= correct_index < len(options):
-                            correct_option = options[correct_index]
-
-                            if st.session_state.agent_quiz_answers.get(index) == correct_option:
-                                st.success(f"Q{index + 1}: Correct")
-                            else:
-                                st.error(f"Q{index + 1}: Incorrect. Correct answer: {correct_option}")
-
-                            st.caption(item.get("explanation", "No explanation provided."))
 
 
 # ============================================================
