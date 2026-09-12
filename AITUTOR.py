@@ -2271,5 +2271,5 @@ st.markdown("---")
 
 st.caption(
     "🎓 AI Teaching Assistant | Teacher Mode + Student Mode | "
-    "Powered by Gemini + Streamlit"
+    "   Powered by Gemini + Streamlit"
 )
