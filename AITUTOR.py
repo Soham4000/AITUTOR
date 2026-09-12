@@ -91,8 +91,12 @@ AGENT_SYSTEM_INSTRUCTION = """You are an autonomous teaching-prep agent \
 embedded in a teacher's classroom-prep tool.
 
 Guidelines:
-- Break the teacher's goal into the smallest set of concrete actions
-  needed to satisfy it.
+- Your VERY FIRST action, before calling any other tool, MUST be
+  present_plan: list the concrete steps (and which tools you intend to
+  call for each) that you plan to take to satisfy the goal. Call it
+  ALONE. Wait for the teacher's approval before taking any other action.
+- After the plan is approved, break the goal into the smallest set of
+  concrete actions needed to satisfy it.
 - Call multiple independent tools in the SAME turn when their results
   don't depend on each other (for example, practice MCQs and a graded
   quiz can usually be generated together once the topic is known).
@@ -103,13 +107,39 @@ Guidelines:
   ambiguous or missing information you cannot reasonably infer (for
   example, no subject or topic given at all). Call it ALONE, never
   combined with other tool calls, and only once per genuine gap.
-  Prefer acting on a sensible default over asking.
+  Prefer acting on a sensible default over asking. If you need to ask a
+  clarifying question, it may come either before or after the plan, but
+  present_plan must still be your first call overall.
 - When every needed artifact has been produced, respond with a concise
   plain-text summary of what you made and why, with no further tool
   calls.
 """
 
 AGENT_TOOLS = [
+    {
+        "name": "present_plan",
+        "description": (
+            "Present the concrete steps you intend to take to satisfy "
+            "the goal, before doing anything else. MUST be your first "
+            "tool call, called ALONE, every run. The teacher approves "
+            "or the run stops here."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "steps": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": (
+                        "Short, plain-language steps, e.g. "
+                        "'Check which students are struggling', "
+                        "'Generate a review-focused lesson plan on X'."
+                    ),
+                },
+            },
+            "required": ["steps"],
+        },
+    },
     {
         "name": "check_student_risk_data",
         "description": (
@@ -578,6 +608,11 @@ Make it classroom-ready with definitions, examples, and a summary."""
         # is a defensive fallback only.
         return "Waiting for the teacher's answer."
 
+    if name == "present_plan":
+        # Normally intercepted by the loop before reaching dispatch; this
+        # is a defensive fallback only.
+        return "Plan approved by the teacher."
+
     return f"Unknown tool: {name}"
 
 
@@ -622,6 +657,21 @@ def _drive_agent_loop(chat, response, ctx, log, step):
                 "status": "done",
                 "chat": chat,
                 "final_text": final_text,
+                "step": step,
+            }
+
+        plan_call = next(
+            (c for c in calls if c.name == "present_plan"), None
+        )
+
+        if plan_call is not None:
+            steps = list(dict(plan_call.args).get("steps", []))
+            log(f"**Step {step}:** Agent proposes a plan:\n" + "\n".join(f"- {s}" for s in steps))
+            return {
+                "status": "plan_ready",
+                "chat": chat,
+                "plan_steps": steps,
+                "pending_call_name": plan_call.name,
                 "step": step,
             }
 
@@ -1136,6 +1186,7 @@ _DEFAULT_STATE = {
     "agent_step": 0,
     "agent_pending_question": "",
     "agent_pending_call_name": "",
+    "agent_pending_plan_steps": [],
     "agent_quiz_questions": [],
     "agent_quiz_answers": {},
     "agent_quiz_score": None,
@@ -2187,6 +2238,34 @@ Instructions:
 
             return _log
 
+        def _apply_agent_state(state, ctx):
+            """Common bookkeeping after start_agent()/continue_agent_with_answer()
+            returns — handles all three possible outcomes: it paused for a
+            plan approval, paused for a clarifying answer, or finished."""
+
+            st.session_state.agent_chat = state.get("chat")
+            st.session_state.agent_step = state.get("step", 0)
+            st.session_state.agent_outputs = ctx.get("outputs", {})
+
+            st.session_state.agent_pending_question = ""
+            st.session_state.agent_pending_call_name = ""
+            st.session_state.agent_pending_plan_steps = []
+
+            if state["status"] == "plan_ready":
+                st.session_state.agent_pending_plan_steps = state["plan_steps"]
+                st.session_state.agent_pending_call_name = state["pending_call_name"]
+            elif state["status"] == "needs_input":
+                st.session_state.agent_pending_question = state["pending_question"]
+                st.session_state.agent_pending_call_name = state["pending_call_name"]
+            elif state["status"] == "done":
+                st.session_state.agent_final_summary = state["final_text"]
+                if ctx.get("quiz_questions"):
+                    st.session_state.agent_quiz_questions = ctx["quiz_questions"]
+            else:
+                st.session_state.agent_final_summary = (
+                    "The agent stopped early due to an error — see the log above."
+                )
+
         run_disabled = agent_model is None
 
         if run_disabled:
@@ -2214,6 +2293,7 @@ Instructions:
                 st.session_state.agent_quiz_score = None
                 st.session_state.agent_pending_question = ""
                 st.session_state.agent_pending_call_name = ""
+                st.session_state.agent_pending_plan_steps = []
 
                 ctx = {
                     "pdf_text": st.session_state.get("pdf_text", ""),
@@ -2228,22 +2308,65 @@ Instructions:
                 with st.spinner("Agent is planning and acting..."):
                     state = start_agent(agent_goal, ctx, log=log)
 
-                st.session_state.agent_chat = state.get("chat")
-                st.session_state.agent_step = state.get("step", 0)
-                st.session_state.agent_outputs = ctx.get("outputs", {})
+                _apply_agent_state(state, ctx)
+                st.rerun()
 
-                if state["status"] == "needs_input":
-                    st.session_state.agent_pending_question = state["pending_question"]
-                    st.session_state.agent_pending_call_name = state["pending_call_name"]
-                elif state["status"] == "done":
-                    st.session_state.agent_final_summary = state["final_text"]
-                    if ctx.get("quiz_questions"):
-                        st.session_state.agent_quiz_questions = ctx["quiz_questions"]
-                else:
-                    st.session_state.agent_final_summary = (
-                        "The agent stopped early due to an error — see the log above."
+        # --------------------------------------------------------
+        # Plan approval pause/resume
+        # --------------------------------------------------------
+
+        if st.session_state.get("agent_pending_plan_steps"):
+
+            st.markdown("---")
+            st.info("📋 **Agent's proposed plan — approve to run it:**")
+            for s in st.session_state.agent_pending_plan_steps:
+                st.markdown(f"- {s}")
+
+            col_approve, col_cancel = st.columns(2)
+
+            with col_approve:
+                approve_clicked = st.button(
+                    "▶️ Approve & Run",
+                    key="agent_approve_plan",
+                    use_container_width=True
+                )
+
+            with col_cancel:
+                cancel_clicked = st.button(
+                    "✖️ Cancel",
+                    key="agent_cancel_plan",
+                    use_container_width=True
+                )
+
+            if cancel_clicked:
+                st.session_state.agent_pending_plan_steps = []
+                st.session_state.agent_pending_call_name = ""
+                st.session_state.agent_final_summary = "Run cancelled before execution."
+                st.rerun()
+
+            if approve_clicked:
+
+                ctx = {
+                    "pdf_text": st.session_state.get("pdf_text", ""),
+                    "student_df": st.session_state.get("uploaded_student_data"),
+                    "education_level": education_level,
+                    "language": response_language,
+                    "outputs": st.session_state.get("agent_outputs", {}),
+                }
+
+                log = _make_agent_logger()
+
+                with st.spinner("Agent is executing the approved plan..."):
+                    state = continue_agent_with_answer(
+                        st.session_state.agent_chat,
+                        st.session_state.agent_pending_call_name,
+                        "Approved. Proceed with the plan.",
+                        ctx,
+                        log=log,
+                        step=st.session_state.get("agent_step", 0),
                     )
 
+                _apply_agent_state(state, ctx)
                 st.rerun()
 
         # --------------------------------------------------------
@@ -2293,24 +2416,7 @@ Instructions:
                             step=st.session_state.get("agent_step", 0),
                         )
 
-                    st.session_state.agent_chat = state.get("chat")
-                    st.session_state.agent_step = state.get("step", 0)
-                    st.session_state.agent_outputs = ctx.get("outputs", {})
-                    st.session_state.agent_pending_question = ""
-                    st.session_state.agent_pending_call_name = ""
-
-                    if state["status"] == "needs_input":
-                        st.session_state.agent_pending_question = state["pending_question"]
-                        st.session_state.agent_pending_call_name = state["pending_call_name"]
-                    elif state["status"] == "done":
-                        st.session_state.agent_final_summary = state["final_text"]
-                        if ctx.get("quiz_questions"):
-                            st.session_state.agent_quiz_questions = ctx["quiz_questions"]
-                    else:
-                        st.session_state.agent_final_summary = (
-                            "The agent stopped early due to an error — see the log above."
-                        )
-
+                    _apply_agent_state(state, ctx)
                     st.rerun()
 
         # --------------------------------------------------------
@@ -2318,6 +2424,7 @@ Instructions:
         # --------------------------------------------------------
 
         if st.session_state.get("agent_final_summary"):
+
 
             st.markdown("---")
             st.subheader("✅ Agent Summary")
