@@ -459,6 +459,19 @@ def _analyze_class_performance(df) -> str:
 
 
 # ------------------------------------------------------------
+# Course-pack compiler — merges every artifact the agent produced
+# into a single combined document, so the teacher can download one
+# PDF instead of clicking through each one individually.
+# ------------------------------------------------------------
+
+def build_course_pack_text(outputs: dict) -> str:
+    sections = []
+    for name, content in outputs.items():
+        sections.append(f"# {name}\n\n{content}")
+    return "\n\n---\n\n".join(sections)
+
+
+# ------------------------------------------------------------
 # Tool dispatch
 # ------------------------------------------------------------
 
@@ -617,21 +630,51 @@ Make it classroom-ready with definitions, examples, and a summary."""
 
 
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Friendly, human-readable labels for the activity log — turns
+# "generate_lesson_plan({'topic': 'X'})" into something a teacher
+# actually enjoys watching scroll by.
+# ------------------------------------------------------------
+
+TOOL_LABELS = {
+    "present_plan": "📋 Proposing a plan",
+    "ask_clarifying_question": "❓ Asking a clarifying question",
+    "check_student_risk_data": "📊 Checking which students are struggling",
+    "analyze_class_performance": "📈 Analyzing class-wide performance patterns",
+    "read_lesson_material": "📄 Reading the uploaded lesson material",
+    "generate_lesson_plan": "📘 Drafting a lesson plan",
+    "generate_mcqs": "📝 Writing practice MCQs",
+    "generate_quiz": "🎯 Building a graded quiz",
+    "generate_assignment": "📚 Preparing an assignment",
+    "generate_question_paper": "🗒️ Drafting a question paper",
+    "generate_teaching_material": "🎨 Creating teaching material",
+}
+
+
+def _tool_label(name: str) -> str:
+    return TOOL_LABELS.get(name, f"🔧 Calling {name}")
+
+
+# ------------------------------------------------------------
 # The agent loop
 # ------------------------------------------------------------
 #
-# Supports two things a single-call-at-a-time loop can't:
+# Supports three things a single-call-at-a-time loop can't:
 #   1. PARALLEL tool calls — if Gemini returns more than one function
 #      call in a single turn, all of them are executed and their results
 #      are sent back together in one message, instead of one round trip
 #      per tool.
-#   2. PAUSING for a clarifying question — the loop can hand control back
-#      to the teacher mid-run instead of guessing, then resume exactly
-#      where it left off once an answer is provided. This is why the
-#      loop is split into start/continue instead of one blocking call:
-#      Streamlit reruns the whole script on every interaction, so the
-#      live `chat` session has to be handed back to the caller to stash
-#      in st.session_state rather than looped over internally.
+#   2. PAUSING for a plan approval or a clarifying question — the loop
+#      can hand control back to the teacher mid-run instead of guessing
+#      or barreling ahead, then resume exactly where it left off once an
+#      answer is provided. This is why the loop is split into
+#      start/continue instead of one blocking call: Streamlit reruns the
+#      whole script on every interaction, so the live `chat` session has
+#      to be handed back to the caller to stash in st.session_state
+#      rather than looped over internally.
+#   3. SELF-REVIEW — once the agent thinks it's done, it's asked once,
+#      using its own tools if needed, to check its work against the
+#      original goal before actually finishing (see run_self_review).
 
 def _extract_function_calls(response):
     candidate = response.candidates[0]
@@ -652,7 +695,7 @@ def _drive_agent_loop(chat, response, ctx, log, step):
 
         if not calls:
             final_text = _final_text_from_response(response)
-            log(f"**Step {step}:** Agent finished — no further actions needed.")
+            log(f"**Step {step}:** ✅ Agent finished — no further actions needed.")
             return {
                 "status": "done",
                 "chat": chat,
@@ -666,7 +709,7 @@ def _drive_agent_loop(chat, response, ctx, log, step):
 
         if plan_call is not None:
             steps = list(dict(plan_call.args).get("steps", []))
-            log(f"**Step {step}:** Agent proposes a plan:\n" + "\n".join(f"- {s}" for s in steps))
+            log(f"**Step {step}:** {_tool_label('present_plan')}")
             return {
                 "status": "plan_ready",
                 "chat": chat,
@@ -681,7 +724,7 @@ def _drive_agent_loop(chat, response, ctx, log, step):
 
         if clarifying is not None:
             question = dict(clarifying.args).get("question", "Could you clarify the goal?")
-            log(f"**Step {step}:** Agent needs clarification: {question}")
+            log(f"**Step {step}:** {_tool_label('ask_clarifying_question')}: {question}")
             return {
                 "status": "needs_input",
                 "chat": chat,
@@ -694,10 +737,10 @@ def _drive_agent_loop(chat, response, ctx, log, step):
 
         for call in calls:
             args = dict(call.args)
-            log(f"**Step {step}:** Agent calls `{call.name}({args})`")
+            log(f"**Step {step}:** {_tool_label(call.name)}")
 
             result = execute_agent_tool(call.name, args, ctx)
-            log(f"**Step {step} result ({call.name}):** {result}")
+            log(f"↳ {result}")
 
             response_parts.append(
                 genai.protos.Part(
@@ -719,14 +762,47 @@ def _drive_agent_loop(chat, response, ctx, log, step):
     return {"status": "done", "chat": chat, "final_text": final_text, "step": step}
 
 
+def run_self_review(chat, ctx: dict, log, step: int, goal: str):
+    """
+    One bounded self-correction pass: once the agent thinks it's done,
+    it's asked to check its own work against the ORIGINAL goal and, if
+    it finds a real gap, fix it using its tools — before actually
+    finishing. This runs at most once per run (the caller only invokes
+    it right after a "done" status, never recursively from inside
+    itself), so it can't turn into an endless self-review loop.
+    """
+
+    review_prompt = f"""Before finishing, double-check your work against the
+ORIGINAL GOAL you were given:
+
+"{goal}"
+
+If anything is missing, incomplete, or noticeably weak relative to that
+goal, use the available tools now to fix it. If everything you already
+produced fully satisfies the goal, reply with a short confirmation and
+do NOT call any tools."""
+
+    log("**Self-review:** 🔍 Checking the work against the original goal...")
+
+    try:
+        response = chat.send_message(review_prompt)
+    except Exception as e:
+        log(f"Agent API error during self-review: {e}")
+        return {"status": "error", "chat": chat, "step": step}
+
+    return _drive_agent_loop(chat, response, ctx, log, step=step)
+
+
 def start_agent(goal: str, ctx: dict, log=print):
     """Starts a new agent chat and runs it until it finishes, needs a
-    clarifying answer, or errors. Returns a state dict to stash in
-    st.session_state."""
+    plan approval or clarifying answer, or errors. Returns a state dict
+    to stash in st.session_state."""
 
     if agent_model is None:
         log("Agent Mode is not available: Gemini API key not configured.")
         return {"status": "error", "chat": None}
+
+    ctx["goal"] = goal  # kept for the self-review pass, even across pauses
 
     chat = agent_model.start_chat()
 
@@ -736,12 +812,18 @@ def start_agent(goal: str, ctx: dict, log=print):
         log(f"Agent API error: {e}")
         return {"status": "error", "chat": None}
 
-    return _drive_agent_loop(chat, response, ctx, log, step=0)
+    state = _drive_agent_loop(chat, response, ctx, log, step=0)
+
+    if state["status"] == "done":
+        state = run_self_review(chat, ctx, log, state["step"], goal)
+
+    return state
 
 
 def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: dict, log=print, step: int = 0):
-    """Resumes a paused agent after the teacher answers a clarifying
-    question, continuing from exactly where it left off."""
+    """Resumes a paused agent after the teacher approves a plan or
+    answers a clarifying question, continuing from exactly where it
+    left off."""
 
     try:
         response = chat.send_message(
@@ -758,7 +840,13 @@ def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: d
         log(f"Agent API error: {e}")
         return {"status": "error", "chat": chat, "step": step}
 
-    return _drive_agent_loop(chat, response, ctx, log, step=step)
+    state = _drive_agent_loop(chat, response, ctx, log, step=step)
+
+    if state["status"] == "done":
+        goal = ctx.get("goal", "the teacher's stated goal")
+        state = run_self_review(chat, ctx, log, state["step"], goal)
+
+    return state
 
 
 # ============================================================
@@ -2190,28 +2278,34 @@ Instructions:
         st.header("🤖 Autonomous Course Prep Agent")
 
         st.write(
-            "Describe a goal instead of picking a tool. The agent decides "
-            "which actions to use, in what order, whether to run several "
-            "at once, and — if the goal is genuinely unclear — it will "
-            "ask you instead of guessing."
+            "Describe a goal instead of picking a tool. The agent plans "
+            "its approach and waits for your approval, decides which "
+            "actions to use and whether to run several at once, asks you "
+            "instead of guessing when the goal is unclear, and "
+            "double-checks its own work against your goal before calling "
+            "itself done."
         )
 
         with st.expander("What can the agent do on its own?"):
             st.markdown(
-                "- Check the uploaded student CSV for at-risk students\n"
-                "- Run a deeper class-performance analysis (averages, "
+                "- 📋 Propose a plan and wait for your approval before "
+                "doing anything\n"
+                "- 📊 Check the uploaded student CSV for at-risk students\n"
+                "- 📈 Run a deeper class-performance analysis (averages, "
                 "gaps between at-risk and class-wide numbers)\n"
-                "- Read the previously uploaded lesson PDF\n"
-                "- Generate a lesson plan\n"
-                "- Generate practice MCQs\n"
-                "- Generate a graded quiz (takeable right here, not just "
-                "a text dump)\n"
-                "- Generate a full assignment\n"
-                "- Generate a formal question paper\n"
-                "- Generate other teaching material (notes, handouts, "
+                "- 📄 Read the previously uploaded lesson PDF\n"
+                "- 📘 Generate a lesson plan\n"
+                "- 📝 Generate practice MCQs\n"
+                "- 🎯 Generate a graded quiz (takeable right here, not "
+                "just a text dump)\n"
+                "- 📚 Generate a full assignment\n"
+                "- 🗒️ Generate a formal question paper\n"
+                "- 🎨 Generate other teaching material (notes, handouts, "
                 "case studies, revision sheets)\n"
-                "- Ask you a clarifying question if it genuinely can't "
-                "tell what you want\n\n"
+                "- ❓ Ask you a clarifying question if it genuinely can't "
+                "tell what you want\n"
+                "- 🔍 Review its own output against your goal before "
+                "finishing, and fix gaps it finds\n\n"
                 "It can call several of these in the same step when they "
                 "don't depend on each other, instead of one at a time."
             )
@@ -2226,17 +2320,28 @@ Instructions:
             key="agent_goal"
         )
 
-        def _make_agent_logger():
+        def _make_agent_logger(label="🤖 Agent is working..."):
             log_lines = list(st.session_state.get("agent_log", []))
-            log_area = st.empty()
-            log_area.markdown("\n\n".join(log_lines) if log_lines else "")
+            status_box = st.status(label, expanded=True)
+            log_area = status_box.empty()
+            log_area.markdown("\n\n".join(log_lines) if log_lines else "_Starting up..._")
 
             def _log(msg):
                 log_lines.append(msg)
                 st.session_state.agent_log = log_lines
                 log_area.markdown("\n\n".join(log_lines))
 
-            return _log
+            return _log, status_box
+
+        def _finish_status(status_box, state):
+            if state["status"] == "done":
+                status_box.update(label="✅ Agent finished", state="complete")
+            elif state["status"] == "plan_ready":
+                status_box.update(label="📋 Waiting for plan approval", state="complete")
+            elif state["status"] == "needs_input":
+                status_box.update(label="❓ Waiting for your answer", state="complete")
+            else:
+                status_box.update(label="⚠️ Agent stopped early", state="error")
 
         def _apply_agent_state(state, ctx):
             """Common bookkeeping after start_agent()/continue_agent_with_answer()
@@ -2303,12 +2408,12 @@ Instructions:
                     "outputs": {},
                 }
 
-                log = _make_agent_logger()
+                log, status_box = _make_agent_logger("🤖 Agent is planning and acting...")
 
-                with st.spinner("Agent is planning and acting..."):
-                    state = start_agent(agent_goal, ctx, log=log)
+                state = start_agent(agent_goal, ctx, log=log)
 
                 _apply_agent_state(state, ctx)
+                _finish_status(status_box, state)
                 st.rerun()
 
         # --------------------------------------------------------
@@ -2352,21 +2457,22 @@ Instructions:
                     "education_level": education_level,
                     "language": response_language,
                     "outputs": st.session_state.get("agent_outputs", {}),
+                    "goal": st.session_state.get("agent_goal", ""),
                 }
 
-                log = _make_agent_logger()
+                log, status_box = _make_agent_logger("🤖 Agent is executing the approved plan...")
 
-                with st.spinner("Agent is executing the approved plan..."):
-                    state = continue_agent_with_answer(
-                        st.session_state.agent_chat,
-                        st.session_state.agent_pending_call_name,
-                        "Approved. Proceed with the plan.",
-                        ctx,
-                        log=log,
-                        step=st.session_state.get("agent_step", 0),
-                    )
+                state = continue_agent_with_answer(
+                    st.session_state.agent_chat,
+                    st.session_state.agent_pending_call_name,
+                    "Approved. Proceed with the plan.",
+                    ctx,
+                    log=log,
+                    step=st.session_state.get("agent_step", 0),
+                )
 
                 _apply_agent_state(state, ctx)
+                _finish_status(status_box, state)
                 st.rerun()
 
         # --------------------------------------------------------
@@ -2402,21 +2508,22 @@ Instructions:
                         "education_level": education_level,
                         "language": response_language,
                         "outputs": st.session_state.get("agent_outputs", {}),
+                        "goal": st.session_state.get("agent_goal", ""),
                     }
 
-                    log = _make_agent_logger()
+                    log, status_box = _make_agent_logger("🤖 Agent is continuing...")
 
-                    with st.spinner("Agent is continuing..."):
-                        state = continue_agent_with_answer(
-                            st.session_state.agent_chat,
-                            st.session_state.agent_pending_call_name,
-                            clarifying_answer,
-                            ctx,
-                            log=log,
-                            step=st.session_state.get("agent_step", 0),
-                        )
+                    state = continue_agent_with_answer(
+                        st.session_state.agent_chat,
+                        st.session_state.agent_pending_call_name,
+                        clarifying_answer,
+                        ctx,
+                        log=log,
+                        step=st.session_state.get("agent_step", 0),
+                    )
 
                     _apply_agent_state(state, ctx)
+                    _finish_status(status_box, state)
                     st.rerun()
 
         # --------------------------------------------------------
@@ -2425,12 +2532,38 @@ Instructions:
 
         if st.session_state.get("agent_final_summary"):
 
-
             st.markdown("---")
-            st.subheader("✅ Agent Summary")
-            st.markdown(st.session_state.agent_final_summary)
+            st.success(st.session_state.agent_final_summary)
 
             outputs = st.session_state.get("agent_outputs", {})
+
+            if outputs:
+                metric_cols = st.columns(3)
+                with metric_cols[0]:
+                    st.metric("Artifacts produced", len(outputs))
+                with metric_cols[1]:
+                    st.metric("Steps taken", st.session_state.get("agent_step", 0))
+                with metric_cols[2]:
+                    st.metric(
+                        "Interactive quiz",
+                        "Ready" if st.session_state.get("agent_quiz_questions") else "—"
+                    )
+
+                try:
+                    pack_bytes = generate_pdf_bytes(
+                        build_course_pack_text(outputs),
+                        title="Course Prep Pack",
+                    )
+                    st.download_button(
+                        label="📦 Download Full Course Pack (all artifacts, one PDF)",
+                        data=pack_bytes,
+                        file_name="course_pack.pdf",
+                        mime="application/pdf",
+                        key="pdf_download_agent_course_pack",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"Could not prepare the combined course pack: {e}")
 
             for artifact_name, artifact_content in outputs.items():
 
