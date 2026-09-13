@@ -23,10 +23,19 @@ st.set_page_config(
 # CUSTOM CSS
 # ============================================================
 #
-# Design direction: "Academic ledger" — deep study-navy and honor-roll
-# gold, serif headings for gravitas, clean sans for legibility. Built
-# for this subject specifically (a gradebook/classroom tool), not the
-# generic cream+terracotta or identical-rounded-SaaS-card defaults.
+# Design direction: "Academic ledger" — near-black backgrounds and
+# honor-roll gold, serif headings for gravitas, clean sans for
+# legibility. The actual dark theme (backgrounds, text contrast, form
+# inputs, alerts, dropdowns) is set via .streamlit/config.toml, NOT
+# here — Streamlit's own components assume a light theme unless the
+# theme config says otherwise, so painting backgrounds black with CSS
+# alone leaves things like alert boxes and dropdowns with light text on
+# light surfaces in spots this file can't fully predict. This CSS only
+# layers the accent styling (fonts, banner, cards, tabs, chat bubbles)
+# on top of that base theme.
+#
+# REQUIRED: see config_toml_for_dark_theme.toml (provided alongside
+# this file) — copy it to .streamlit/config.toml in your repo root.
 
 st.markdown("""
 <style>
@@ -34,23 +43,19 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
 :root {
-    --ink-900: #16213E;
-    --ink-800: #1F3A5F;
-    --ink-700: #2C4A73;
+    --surface: #15171C;
+    --surface-2: #1E2128;
+    --border: #2A2D35;
     --gold-600: #C6912F;
     --gold-500: #D9A441;
     --gold-200: #F3DCA0;
-    --paper-100: #FAFAF8;
-    --paper-000: #FFFFFF;
-    --text-900: #1A1F2B;
-    --text-600: #5B6472;
-    --line-200: #E4E1D8;
-    --success-700: #3F7D58;
+    --text-100: #F5F1E8;
+    --text-400: #A9ADB8;
+    --text-on-gold: #1A1200;
 }
 
 html, body, [class*="css"] {
     font-family: 'Inter', sans-serif;
-    color: var(--text-900);
 }
 
 h1, h2, h3, .main-title {
@@ -59,14 +64,10 @@ h1, h2, h3, .main-title {
     letter-spacing: -0.01em;
 }
 
-.stApp {
-    background: var(--paper-100);
-}
-
 /* ---------- Header banner ---------- */
 
 .app-banner {
-    background: linear-gradient(120deg, var(--ink-900) 0%, var(--ink-800) 65%, var(--ink-700) 100%);
+    background: linear-gradient(120deg, var(--surface) 0%, var(--surface-2) 100%);
     border-radius: 10px;
     padding: 28px 36px;
     margin-bottom: 22px;
@@ -76,7 +77,7 @@ h1, h2, h3, .main-title {
 .main-title {
     font-size: 34px;
     font-weight: 700;
-    color: var(--paper-000);
+    color: var(--text-100);
     text-align: left;
     margin: 0 0 4px 0;
 }
@@ -94,52 +95,34 @@ h1, h2, h3, .main-title {
 .card {
     padding: 18px 22px;
     border-radius: 8px;
-    border: 1px solid var(--line-200);
+    border: 1px solid var(--border);
     border-left: 4px solid var(--gold-500);
-    background: var(--paper-000);
+    background: var(--surface);
     margin-bottom: 18px;
 }
 
 /* ---------- Sidebar ---------- */
 
 section[data-testid="stSidebar"] {
-    background: var(--ink-900);
-}
-
-section[data-testid="stSidebar"] * {
-    color: var(--paper-100) !important;
-}
-
-section[data-testid="stSidebar"] .stSelectbox > div > div,
-section[data-testid="stSidebar"] input {
-    background-color: var(--ink-800) !important;
-    border-color: var(--ink-700) !important;
-}
-
-section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] {
-    color: var(--ink-900) !important;
-}
-
-section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] * {
-    color: var(--ink-900) !important;
+    border-right: 1px solid var(--border);
 }
 
 /* ---------- Tabs ---------- */
 
 .stTabs [data-baseweb="tab-list"] {
     gap: 4px;
-    border-bottom: 1px solid var(--line-200);
+    border-bottom: 1px solid var(--border);
 }
 
 .stTabs [data-baseweb="tab"] {
     font-family: 'Fraunces', serif;
     font-weight: 600;
-    color: var(--text-600);
+    color: var(--text-400);
     padding: 10px 16px;
 }
 
 .stTabs [aria-selected="true"] {
-    color: var(--ink-900);
+    color: var(--text-100);
     border-bottom: 3px solid var(--gold-500) !important;
 }
 
@@ -149,15 +132,15 @@ section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] * {
     font-family: 'Inter', sans-serif;
     font-weight: 600;
     border-radius: 6px;
-    border: 1px solid var(--ink-900);
-    background: var(--ink-900);
-    color: var(--paper-000);
-    transition: background 0.15s ease, transform 0.05s ease;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-100);
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
 }
 
 .stButton > button:hover {
-    background: var(--ink-800);
-    border-color: var(--ink-800);
+    background: var(--surface-2);
+    border-color: var(--gold-500);
 }
 
 .stButton > button:active {
@@ -168,7 +151,7 @@ section[data-testid="stSidebar"] div[data-testid^="stAlertContent"] * {
 div[data-testid="stDownloadButton"] > button {
     background: var(--gold-500);
     border-color: var(--gold-600);
-    color: var(--ink-900);
+    color: var(--text-on-gold);
 }
 
 .stButton > button[kind="primary"]:hover,
@@ -179,33 +162,24 @@ div[data-testid="stDownloadButton"] > button:hover {
 /* ---------- Metrics ---------- */
 
 div[data-testid="stMetric"] {
-    background: var(--paper-000);
-    border: 1px solid var(--line-200);
+    background: var(--surface);
+    border: 1px solid var(--border);
     border-top: 3px solid var(--gold-500);
     border-radius: 8px;
     padding: 12px 14px;
 }
 
 div[data-testid="stMetricValue"] {
-    color: var(--ink-900);
+    color: var(--text-100);
     font-family: 'Fraunces', serif;
-}
-
-/* ---------- Alerts / status ---------- */
-
-div[data-testid="stAlertContentInfo"],
-div[data-testid="stAlertContentSuccess"],
-div[data-testid="stAlertContentError"],
-div[data-testid="stAlertContentWarning"] {
-    border-radius: 8px;
 }
 
 /* ---------- Expanders ---------- */
 
 details[data-testid="stExpander"] {
-    border: 1px solid var(--line-200);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: var(--paper-000);
+    background: var(--surface);
 }
 
 /* ---------- Chat (Agent Mode) ---------- */
@@ -217,19 +191,13 @@ div[data-testid="stChatMessage"] {
 }
 
 div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
-    background: var(--ink-900);
-}
-
-div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) * {
-    color: var(--paper-100) !important;
+    background: var(--surface-2);
 }
 
 div[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
-    background: var(--paper-000);
+    background: var(--surface);
+    border: 1px solid var(--border);
     border-left: 4px solid var(--gold-500);
-    border: 1px solid var(--line-200);
-    border-left-width: 4px;
-    border-left-color: var(--gold-500);
 }
 
 </style>
