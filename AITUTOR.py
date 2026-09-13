@@ -1063,6 +1063,95 @@ def is_gemini_error(response_text: str) -> bool:
 
 
 # ============================================================
+# SHARED CHAT PANEL — interactive, multi-turn, with persisted history
+# ============================================================
+#
+# For places where a real back-and-forth (with follow-ups that remember
+# earlier context) is more useful than a single one-shot answer: doubt
+# solving, PDF Q&A. Backed by the plain `model` (no tools — this isn't
+# Agent Mode's tool-calling loop, just an ordinary multi-turn chat).
+# Each panel keeps its own independent conversation + chat session,
+# scoped by `state_prefix`, so multiple panels on the same page don't
+# collide.
+
+def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=None, empty_hint: str = None):
+    """
+    state_prefix:        unique key prefix for this panel's session state.
+    placeholder:         placeholder text for the chat input box.
+    seed_prompt_builder: optional callable(first_message) -> str that
+                          wraps the FIRST message with extra context
+                          (e.g. PDF material, subject/topic, tone
+                          instructions). Follow-ups are sent as-is,
+                          since the model already has that context from
+                          the first turn of the conversation.
+    empty_hint:          optional caption shown before the first message.
+    """
+
+    conv_key = f"{state_prefix}_conversation"
+    chat_key = f"{state_prefix}_chat_session"
+
+    if conv_key not in st.session_state:
+        st.session_state[conv_key] = []
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = None
+
+    if not st.session_state[conv_key] and empty_hint:
+        st.caption(empty_hint)
+
+    for turn in st.session_state[conv_key]:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+
+    user_message = st.chat_input(placeholder, key=f"{state_prefix}_chat_input")
+
+    if user_message:
+        st.session_state[conv_key].append({"role": "user", "content": user_message})
+        with st.chat_message("user"):
+            st.markdown(user_message)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                if model is None:
+                    answer = "Gemini model is not configured."
+                else:
+                    is_first_turn = st.session_state[chat_key] is None
+
+                    if is_first_turn:
+                        st.session_state[chat_key] = model.start_chat()
+
+                    outgoing = user_message
+                    if is_first_turn and seed_prompt_builder:
+                        outgoing = seed_prompt_builder(user_message)
+
+                    try:
+                        response = st.session_state[chat_key].send_message(outgoing)
+                        answer = (
+                            response.text if response and response.text
+                            else "Gemini did not return a response."
+                        )
+                    except Exception as e:
+                        answer = f"Gemini API Error: {e}"
+
+            st.markdown(answer)
+
+        st.session_state[conv_key].append({"role": "assistant", "content": answer})
+
+        if not is_gemini_error(answer):
+            render_pdf_download_button(
+                answer,
+                title="Chat Answer",
+                filename=f"{state_prefix}_answer.pdf",
+                key=f"pdf_download_{state_prefix}_{len(st.session_state[conv_key])}",
+            )
+
+    if st.session_state[conv_key]:
+        if st.button("🗑️ Clear Chat", key=f"{state_prefix}_clear_chat"):
+            st.session_state[conv_key] = []
+            st.session_state[chat_key] = None
+            st.rerun()
+
+
+# ============================================================
 # PDF TEXT EXTRACTION (for the PDF Assistant tab — reading a PDF IN)
 # ============================================================
 
@@ -1431,7 +1520,6 @@ _DEFAULT_STATE = {
     "questions_response": "",
     "teaching_material_response": "",
     "student_learning_response": "",
-    "student_doubt_response": "",
     "notes_response": "",
     "mcqs_response": "",
     "quiz_questions": [],
@@ -1439,7 +1527,6 @@ _DEFAULT_STATE = {
     "quiz_score": None,
     "student_analysis_response": "",
     "uploaded_student_data": None,
-    "pdf_qa_response": "",
     "agent_conversation": [],
     "agent_outputs": {},
     "agent_chat": None,
@@ -2379,63 +2466,42 @@ For a case study, include scenario, questions and expected learning outcomes.
 
         if st.session_state.pdf_text:
 
-            pdf_question = st.text_area(
-                "Ask something about the teaching material",
-                placeholder="Example: Create five discussion questions from Unit 1.",
-                height=130,
-                key="teacher_pdf_question"
+            st.markdown("---")
+            st.write(
+                "Chat about the material below — ask a question, then "
+                "send follow-ups and it'll remember the conversation."
             )
 
-            if st.button(
-                "🤖 Ask About PDF",
-                key="teacher_pdf_ask",
-                use_container_width=True
-            ):
-
-                if not pdf_question.strip():
-                    st.warning("Please enter a question.")
-                else:
-
-                    material = st.session_state.pdf_text[:50000]
-
-                    prompt = f"""
-You are an AI Teaching Assistant helping a teacher.
-
-Use the supplied teaching material to answer the request.
+            def _teacher_pdf_seed(first_question):
+                material = st.session_state.pdf_text[:50000]
+                return f"""You are an AI Teaching Assistant helping a teacher.
+This is an ongoing conversation — use the supplied teaching material to
+answer this request and any follow-ups that come later.
 
 Teaching Material:
 ----------------
 {material}
 ----------------
 
-Teacher Request:
-{pdf_question}
+Education Level: {education_level}
+Language: {response_language}
 
-Education Level:
-{education_level}
-
-Language:
-{response_language}
-
-Instructions:
-
-1. Base the response primarily on the supplied material.
+Instructions for every answer in this conversation:
+1. Base responses primarily on the supplied material.
 2. Do not invent information.
 3. Clearly say when the material does not contain the answer.
-4. Make the result practical for teaching.
+4. Make results practical for teaching.
 5. Use headings and bullet points where appropriate.
-"""
 
-                    with st.spinner("Analyzing teaching material..."):
-                        st.session_state.pdf_qa_response = ask_gemini(prompt)
+Teacher's first request:
+{first_question}"""
 
-        show_generated_content(
-            "pdf_qa_response",
-            "🤖 AI Answer",
-            "Teacher PDF Assistant — Answer",
-            "teacher_pdf_answer.pdf",
-            "pdf_download_teacher_pdf",
-        )
+            render_chat_panel(
+                state_prefix="teacher_pdf",
+                placeholder="Ask something about the material, or send a follow-up...",
+                seed_prompt_builder=_teacher_pdf_seed,
+                empty_hint="Ask a question about the uploaded material to start the conversation.",
+            )
 
     # --------------------------------------------------------
     # TEACHER — AGENT MODE
@@ -3037,73 +3103,36 @@ Use clear student-friendly language.
             placeholder="Example: TCP vs UDP"
         )
 
-        doubt = st.text_area(
-            "Describe your doubt",
-            placeholder=(
-                "Example: I understand TCP is reliable, but why is UDP "
-                "used for streaming?"
-            ),
-            height=170,
-            key="student_doubt"
-        )
+        st.markdown("---")
 
-        if st.button(
-            "🤖 Explain My Doubt",
-            key="explain_doubt",
-            use_container_width=True
-        ):
+        def _doubt_seed(first_doubt):
+            return f"""You are a patient personal AI tutor. This is an
+ongoing conversation — continue naturally for any follow-up questions
+the student sends after this one.
 
-            if not doubt.strip():
-                st.warning("Please describe your doubt.")
-            else:
+Subject: {doubt_subject}
+Topic: {doubt_topic}
+Education Level: {education_level}
+Difficulty: {difficulty}
+Language: {response_language}
 
-                prompt = f"""
-You are a patient personal AI tutor.
-
-A student has asked the following doubt.
-
-Subject:
-{doubt_subject}
-
-Topic:
-{doubt_topic}
-
-Student's Doubt:
-{doubt}
-
-Education Level:
-{education_level}
-
-Difficulty:
-{difficulty}
-
-Language:
-{response_language}
-
-Answer the exact doubt.
-
-Instructions:
-
-1. First identify what the student is confused about.
+Instructions for every answer in this conversation:
+1. First identify what the student seems confused about.
 2. Explain it step by step.
 3. Use a simple analogy if useful.
 4. Give an example.
 5. Correct any misconception gently.
 6. End with a short takeaway.
 7. Do not overwhelm the student with unrelated theory.
-"""
 
-                with st.spinner("Solving your doubt..."):
-                    st.session_state.student_doubt_response = ask_gemini(
-                        prompt
-                    )
+Student's first doubt:
+{first_doubt}"""
 
-        show_generated_content(
-            "student_doubt_response",
-            "🤖 Explanation",
-            "Student Doubt — Explanation",
-            "doubt_explanation.pdf",
-            "pdf_download_student_doubt",
+        render_chat_panel(
+            state_prefix="student_doubt",
+            placeholder="Describe your doubt, or ask a follow-up...",
+            seed_prompt_builder=_doubt_seed,
+            empty_hint="Describe your doubt below to start chatting with your tutor.",
         )
 
     # --------------------------------------------------------
@@ -3605,32 +3634,16 @@ Rules:
 
         if st.session_state.pdf_text:
 
-            pdf_question = st.text_area(
-                "Ask something about your study material",
-                placeholder=(
-                    "Example: Explain the main concepts "
-                    "covered in Unit 1."
-                ),
-                height=130,
-                key="student_pdf_question"
+            st.markdown("---")
+            st.write(
+                "Chat about the material below — ask a question, then "
+                "send follow-ups and it'll remember the conversation."
             )
 
-            if st.button(
-                "🤖 Ask About PDF",
-                key="student_pdf_ask",
-                use_container_width=True
-            ):
-
-                if not pdf_question.strip():
-                    st.warning("Please enter a question.")
-                else:
-
-                    material = st.session_state.pdf_text[:50000]
-
-                    prompt = f"""
-You are an AI student tutor.
-
-Answer the student's question using the study
+            def _student_pdf_seed(first_question):
+                material = st.session_state.pdf_text[:50000]
+                return f"""You are an AI student tutor. This is an ongoing
+conversation — answer this question and any follow-ups using the study
 material provided below.
 
 Study Material:
@@ -3638,43 +3651,27 @@ Study Material:
 {material}
 ----------------
 
-Student Question:
-{pdf_question}
+Difficulty: {difficulty}
+Education Level: {education_level}
+Language: {response_language}
 
-Difficulty:
-{difficulty}
-
-Education Level:
-{education_level}
-
-Language:
-{response_language}
-
-Instructions:
-
-1. Base the answer primarily on the provided material.
+Instructions for every answer in this conversation:
+1. Base answers primarily on the provided material.
 2. Explain clearly.
 3. Do not invent information.
-4. If the answer cannot be found in the material,
-   clearly say so.
+4. If the answer cannot be found in the material, clearly say so.
 5. Use examples when useful.
 6. Use headings and bullet points where appropriate.
-"""
 
-                    with st.spinner(
-                        "Analyzing your study material..."
-                    ):
-                        st.session_state.pdf_qa_response = ask_gemini(
-                            prompt
-                        )
+Student's first question:
+{first_question}"""
 
-        show_generated_content(
-            "pdf_qa_response",
-            "🤖 AI Answer",
-            "Student PDF Assistant — Answer",
-            "student_pdf_answer.pdf",
-            "pdf_download_student_pdf",
-        )
+            render_chat_panel(
+                state_prefix="student_pdf",
+                placeholder="Ask something about your study material, or send a follow-up...",
+                seed_prompt_builder=_student_pdf_seed,
+                empty_hint="Ask a question about the uploaded material to start the conversation.",
+            )
 
 
 # ============================================================
