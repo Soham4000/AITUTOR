@@ -3475,15 +3475,9 @@ else:
                 key="learn_topic"
             )
 
-        learning_goal = st.selectbox(
+        learning_goal = st.text_input(
             "What do you want to do?",
-            [
-                "Understand the basics",
-                "Prepare for an exam",
-                "Understand with examples",
-                "Learn step by step",
-                "Revise quickly"
-            ],
+            placeholder="Example: Understand the basics, prepare for an exam, learn step by step...",
             key="learning_goal"
         )
 
@@ -3509,7 +3503,7 @@ Topic:
 {learn_topic}
 
 Student Goal:
-{learning_goal}
+{learning_goal.strip() or "Understand the basics"}
 
 Education Level:
 {education_level}
