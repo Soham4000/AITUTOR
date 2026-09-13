@@ -1,5 +1,8 @@
 import io
 import os
+import json
+import sqlite3
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -791,7 +794,242 @@ Make it classroom-ready with definitions, examples, and a summary."""
     return f"Unknown tool: {name}"
 
 
-# ------------------------------------------------------------
+# ============================================================
+# STUDENT AGENT MODE — a second agent persona
+# ============================================================
+#
+# Same underlying engine (present_plan / ask_clarifying_question
+# interception, parallel tool calls, self-review) as the teacher's
+# agent — just a different tool set, system instruction, and Gemini
+# model instance, so students get their own study-focused actions
+# instead of the teacher's classroom-prep ones. Shared tools
+# (generate_mcqs, generate_quiz, read_lesson_material, present_plan,
+# ask_clarifying_question) are delegated straight to execute_agent_tool
+# rather than reimplemented.
+
+STUDENT_AGENT_SYSTEM_INSTRUCTION = """You are an autonomous personal \
+study agent embedded in a student's learning tool. This is an ongoing \
+chat — the student may send you a new request at any point, including \
+after you've already completed earlier ones. Treat each new request as \
+a fresh goal to plan for, while remembering everything already produced \
+earlier in the conversation.
+
+Guidelines:
+- For EVERY new request the student sends (the very first one, and any
+  follow-up), your first action in response MUST be present_plan: list
+  the concrete steps (and which tools you intend to call for each) that
+  you plan to take. Call it ALONE. Wait for the student's approval
+  before taking any other action for that request.
+- After a plan is approved, break that request into the smallest set of
+  concrete actions needed to satisfy it.
+- Call multiple independent tools in the SAME turn when their results
+  don't depend on each other (for example, study notes and practice
+  MCQs can usually be generated together once the topic is known).
+  Sequence tools that genuinely depend on each other's output (for
+  example, read previously uploaded study material BEFORE deciding
+  what a lesson should emphasize).
+- Only call ask_clarifying_question when a request is genuinely
+  ambiguous or missing information you cannot reasonably infer (for
+  example, no subject or topic given at all). Call it ALONE, never
+  combined with other tool calls, and only once per genuine gap.
+  Prefer acting on a sensible default over asking. If you need to ask a
+  clarifying question, it may come either before or after the plan, but
+  present_plan must still be your first call for that request.
+- A follow-up request may reference or build on artifacts you already
+  produced earlier in this conversation (e.g. "make the notes shorter",
+  "now quiz me on that") — use that context instead of starting over.
+- When every needed artifact for the CURRENT request has been produced,
+  respond with a concise plain-text summary of what you made and why,
+  with no further tool calls.
+"""
+
+STUDENT_AGENT_TOOLS = [
+    next(t for t in AGENT_TOOLS if t["name"] == "present_plan"),
+    next(t for t in AGENT_TOOLS if t["name"] == "ask_clarifying_question"),
+    {
+        "name": "read_lesson_material",
+        "description": (
+            "Read the previously uploaded study material PDF (from the "
+            "PDF Assistant tab) to see what it covers, so a lesson or "
+            "notes can target it directly instead of teaching blind."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        },
+    },
+    {
+        "name": "learn_topic",
+        "description": (
+            "Teach the student a topic from the basics, tailored to "
+            "their stated learning goal. Use this for 'teach me', "
+            "'explain', or 'help me understand' style requests."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topic": {"type": "STRING"},
+                "learning_goal": {
+                    "type": "STRING",
+                    "description": (
+                        "Understand the basics, Prepare for an exam, "
+                        "Understand with examples, Learn step by step, "
+                        "or Revise quickly."
+                    ),
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "explain_doubt",
+        "description": (
+            "Explain a specific doubt or point of confusion the student "
+            "has. Use this when the request is a targeted question about "
+            "something confusing, rather than a request to learn a whole "
+            "topic from scratch."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topic": {"type": "STRING"},
+                "doubt": {"type": "STRING"},
+            },
+            "required": ["doubt"],
+        },
+    },
+    {
+        "name": "generate_notes",
+        "description": (
+            "Create study notes for a topic. Use this when the student "
+            "wants something to read/revise from, not an interactive "
+            "explanation or a quiz."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "subject": {"type": "STRING"},
+                "topic": {"type": "STRING"},
+                "length": {
+                    "type": "STRING",
+                    "description": "Short, Medium, or Detailed.",
+                },
+                "purpose": {
+                    "type": "STRING",
+                    "description": (
+                        "General Study, Exam Preparation, Quick "
+                        "Revision, or Viva Preparation."
+                    ),
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    next(t for t in AGENT_TOOLS if t["name"] == "generate_mcqs"),
+    next(t for t in AGENT_TOOLS if t["name"] == "generate_quiz"),
+]
+
+_STUDENT_DELEGATED_TOOLS = {
+    "present_plan", "ask_clarifying_question", "read_lesson_material",
+    "generate_mcqs", "generate_quiz",
+}
+
+
+def configure_gemini_student_agent():
+    """Separate model instance for the student persona — its own tool
+    set and system instruction, independent of the teacher's agent_model."""
+
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return None
+
+    genai.configure(api_key=api_key)
+
+    return genai.GenerativeModel(
+        "gemini-3.5-flash",
+        tools=STUDENT_AGENT_TOOLS,
+        system_instruction=STUDENT_AGENT_SYSTEM_INSTRUCTION,
+    )
+
+
+student_agent_model = configure_gemini_student_agent()
+
+
+def execute_student_agent_tool(name, args, ctx):
+    """Dispatch table for the student agent. Tools shared with the
+    teacher agent (same name, same behavior) are delegated straight to
+    execute_agent_tool instead of being reimplemented here."""
+
+    if name in _STUDENT_DELEGATED_TOOLS:
+        return execute_agent_tool(name, args, ctx)
+
+    if name == "learn_topic":
+        subject = args.get("subject", "")
+        topic = args.get("topic", "the topic")
+        learning_goal = args.get("learning_goal", "Understand the basics")
+        prompt = f"""You are a friendly AI tutor. Teach the student the
+following topic.
+Subject: {subject}
+Topic: {topic}
+Student Goal: {learning_goal}
+Education Level: {ctx.get('education_level')}
+Difficulty: {ctx.get('difficulty')}
+Language: {ctx.get('language')}
+Include: simple introduction, definition, why it matters, step-by-step
+explanation, a simple example, a real-world example, important terms,
+common mistakes, exam-important points, a quick recap, and three
+self-check questions."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})[f"Lesson: {topic}"] = result
+        return f"Lesson on '{topic}' generated ({len(result)} chars)."
+
+    if name == "explain_doubt":
+        subject = args.get("subject", "")
+        topic = args.get("topic", "")
+        doubt = args.get("doubt", "")
+        prompt = f"""You are a patient personal AI tutor. A student has
+asked the following doubt.
+Subject: {subject}
+Topic: {topic}
+Student's Doubt: {doubt}
+Education Level: {ctx.get('education_level')}
+Difficulty: {ctx.get('difficulty')}
+Language: {ctx.get('language')}
+Instructions: first identify what the student seems confused about,
+explain it step by step, use a simple analogy if useful, give an
+example, correct any misconception gently, and end with a short
+takeaway."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Doubt Explanation"] = result
+        return f"Doubt explained ({len(result)} chars). Stored as 'Doubt Explanation'."
+
+    if name == "generate_notes":
+        subject = args.get("subject", "")
+        topic = args.get("topic", "the topic")
+        length = args.get("length", "Medium")
+        purpose = args.get("purpose", "General Study")
+        prompt = f"""You are an expert student study assistant. Create
+{length.lower()} study notes.
+Subject: {subject}
+Topic: {topic}
+Purpose: {purpose}
+Education Level: {ctx.get('education_level')}
+Difficulty: {ctx.get('difficulty')}
+Language: {ctx.get('language')}
+Include: introduction, definition, important concepts, a clear
+explanation, examples, advantages, disadvantages, applications,
+important examination points, a quick revision summary, and five key
+terms."""
+        result = ask_gemini(prompt)
+        ctx.setdefault("outputs", {})["Study Notes"] = result
+        return f"Study notes generated ({len(result)} chars). Stored as 'Study Notes'."
+
+    return f"Unknown tool: {name}"
+
+
 # ------------------------------------------------------------
 # Friendly, human-readable labels for the activity log — turns
 # "generate_lesson_plan({'topic': 'X'})" into something a teacher
@@ -803,13 +1041,16 @@ TOOL_LABELS = {
     "ask_clarifying_question": "❓ Asking a clarifying question",
     "check_student_risk_data": "📊 Checking which students are struggling",
     "analyze_class_performance": "📈 Analyzing class-wide performance patterns",
-    "read_lesson_material": "📄 Reading the uploaded lesson material",
+    "read_lesson_material": "📄 Reading the uploaded material",
     "generate_lesson_plan": "📘 Drafting a lesson plan",
     "generate_mcqs": "📝 Writing practice MCQs",
     "generate_quiz": "🎯 Building a graded quiz",
     "generate_assignment": "📚 Preparing an assignment",
     "generate_question_paper": "🗒️ Drafting a question paper",
     "generate_teaching_material": "🎨 Creating teaching material",
+    "learn_topic": "🧠 Teaching the topic from scratch",
+    "explain_doubt": "💡 Explaining the doubt",
+    "generate_notes": "📓 Writing study notes",
 }
 
 
@@ -848,7 +1089,7 @@ def _final_text_from_response(response):
     return "".join(part.text for part in candidate.content.parts if part.text)
 
 
-def _drive_agent_loop(chat, response, ctx, log, step):
+def _drive_agent_loop(chat, response, ctx, log, step, tool_dispatch=execute_agent_tool):
 
     while step < AGENT_MAX_STEPS:
         step += 1
@@ -901,7 +1142,7 @@ def _drive_agent_loop(chat, response, ctx, log, step):
             args = dict(call.args)
             log(f"**Step {step}:** {_tool_label(call.name)}")
 
-            result = execute_agent_tool(call.name, args, ctx)
+            result = tool_dispatch(call.name, args, ctx)
             log(f"↳ {result}")
 
             response_parts.append(
@@ -924,7 +1165,7 @@ def _drive_agent_loop(chat, response, ctx, log, step):
     return {"status": "done", "chat": chat, "final_text": final_text, "step": step}
 
 
-def run_self_review(chat, ctx: dict, log, step: int, goal: str):
+def run_self_review(chat, ctx: dict, log, step: int, goal: str, tool_dispatch=execute_agent_tool):
     """
     One bounded self-correction pass: once the agent thinks it's done,
     it's asked to check its own work against the ORIGINAL goal and, if
@@ -952,10 +1193,30 @@ do NOT call any tools."""
         log(f"Agent API error during self-review: {e}")
         return {"status": "error", "chat": chat, "step": step}
 
-    return _drive_agent_loop(chat, response, ctx, log, step=step)
+    return _drive_agent_loop(chat, response, ctx, log, step=step, tool_dispatch=tool_dispatch)
 
 
-def send_agent_message(chat, message: str, ctx: dict, log=print, step: int = 0):
+def _agent_turn_to_replay_text(turn: dict) -> str:
+    """Flattens a saved agent_conversation turn into plain text, for
+    replaying prior conversation into a fresh Gemini chat session via
+    start_chat(history=...). This restores the model's actual memory of
+    what was discussed, not just what the UI displays — an approximate
+    reconstruction (tool-call mechanics aren't replayed, only their
+    outcomes), but far better than starting genuinely cold."""
+
+    if turn.get("role") == "user":
+        return turn.get("content", "")
+
+    kind = turn.get("kind")
+    if kind == "plan":
+        steps = turn.get("plan_steps", [])
+        return "Proposed plan:\n" + "\n".join(f"- {s}" for s in steps)
+    if kind == "clarify":
+        return f"Asked: {turn.get('question', '')}"
+    return turn.get("content", "")
+
+
+def send_agent_message(chat, message: str, ctx: dict, log=print, step: int = 0, model=None, tool_dispatch=execute_agent_tool, history_turns=None):
     """
     Sends a message on the agent's chat — starting a brand-new chat if
     `chat` is None, or continuing an already-open one otherwise. This is
@@ -963,16 +1224,38 @@ def send_agent_message(chat, message: str, ctx: dict, log=print, step: int = 0):
     make a quiz" or "make that harder" reuses the SAME conversation, so
     the model still remembers everything produced earlier, instead of
     starting cold every time.
+
+    `model` lets a different agent persona (e.g. the student study agent)
+    reuse this exact loop instead of duplicating it; defaults to the
+    teacher's agent_model for backward compatibility.
+
+    `history_turns`, if given, is prior agent_conversation turns (loaded
+    from the database, from BEFORE this browser session existed) to
+    replay into a brand-new chat session — so resuming a saved
+    conversation restores real conversational memory, not just what's
+    shown on screen. Only used when `chat` is None.
     """
 
-    if agent_model is None:
+    model = model or agent_model
+
+    if model is None:
         log("Agent Mode is not available: Gemini API key not configured.")
         return {"status": "error", "chat": None}
 
     ctx["goal"] = message  # used by the self-review pass for this request
 
     if chat is None:
-        chat = agent_model.start_chat()
+        if history_turns:
+            replay = [
+                {
+                    "role": "user" if t.get("role") == "user" else "model",
+                    "parts": [_agent_turn_to_replay_text(t)],
+                }
+                for t in history_turns
+            ]
+            chat = model.start_chat(history=replay)
+        else:
+            chat = model.start_chat()
 
     try:
         response = chat.send_message(message)
@@ -980,10 +1263,10 @@ def send_agent_message(chat, message: str, ctx: dict, log=print, step: int = 0):
         log(f"Agent API error: {e}")
         return {"status": "error", "chat": chat, "step": step}
 
-    state = _drive_agent_loop(chat, response, ctx, log, step=step)
+    state = _drive_agent_loop(chat, response, ctx, log, step=step, tool_dispatch=tool_dispatch)
 
     if state["status"] == "done":
-        state = run_self_review(chat, ctx, log, state["step"], message)
+        state = run_self_review(chat, ctx, log, state["step"], message, tool_dispatch=tool_dispatch)
 
     return state
 
@@ -993,9 +1276,9 @@ def start_agent(goal: str, ctx: dict, log=print):
     return send_agent_message(None, goal, ctx, log=log, step=0)
 
 
-def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: dict, log=print, step: int = 0):
-    """Resumes a paused agent after the teacher approves a plan or
-    answers a clarifying question, continuing from exactly where it
+def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: dict, log=print, step: int = 0, tool_dispatch=execute_agent_tool):
+    """Resumes a paused agent after the teacher/student approves a plan
+    or answers a clarifying question, continuing from exactly where it
     left off."""
 
     try:
@@ -1013,13 +1296,437 @@ def continue_agent_with_answer(chat, pending_call_name: str, answer: str, ctx: d
         log(f"Agent API error: {e}")
         return {"status": "error", "chat": chat, "step": step}
 
-    state = _drive_agent_loop(chat, response, ctx, log, step=step)
+    state = _drive_agent_loop(chat, response, ctx, log, step=step, tool_dispatch=tool_dispatch)
 
     if state["status"] == "done":
-        goal = ctx.get("goal", "the teacher's stated goal")
-        state = run_self_review(chat, ctx, log, state["step"], goal)
+        goal = ctx.get("goal", "the stated goal")
+        state = run_self_review(chat, ctx, log, state["step"], goal, tool_dispatch=tool_dispatch)
 
     return state
+
+
+# ============================================================
+# GENERIC AGENT CHAT UI
+# ============================================================
+#
+# Renders a full interactive-agent chat tab: conversation history,
+# plan-approval / clarifying-question pause-resume, a chat input for
+# new/follow-up goals, completion metrics, a combined course-pack PDF,
+# JSON export/import of the chat history, and (if a graded quiz was
+# produced) an interactive quiz to take. Shared by BOTH the teacher's
+# and the student's Agent Mode tabs — state_prefix keeps their session
+# state, widget keys, and conversations completely independent.
+
+def _make_status_logger(label: str):
+    """Live st.status()-backed logger scoped to a single turn."""
+    turn_log_lines = []
+    status_box = st.status(label, expanded=True)
+    log_area = status_box.empty()
+    log_area.markdown("_Starting up..._")
+
+    def _log(msg):
+        turn_log_lines.append(msg)
+        log_area.markdown("\n\n".join(turn_log_lines))
+
+    return _log, status_box, turn_log_lines
+
+
+def _finish_status_box(status_box, state):
+    if state["status"] == "done":
+        status_box.update(label="✅ Done", state="complete")
+    elif state["status"] == "plan_ready":
+        status_box.update(label="📋 Waiting for plan approval", state="complete")
+    elif state["status"] == "needs_input":
+        status_box.update(label="❓ Waiting for your answer", state="complete")
+    else:
+        status_box.update(label="⚠️ Stopped early", state="error")
+
+
+def _render_agent_artifact(artifact_name: str, artifact_content: str, key_suffix: str):
+    st.markdown(f"**{artifact_name}**")
+    if artifact_name in ("Practice MCQs", "Graded Quiz"):
+        st.caption(
+            "Raw generated JSON — see the interactive quiz below if "
+            "this is the graded quiz."
+        )
+        st.code(artifact_content, language="json")
+    else:
+        st.markdown(artifact_content)
+
+    render_pdf_download_button(
+        artifact_content,
+        title=artifact_name,
+        filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
+        key=f"pdf_download_{key_suffix}_{artifact_name}",
+    )
+
+
+def render_agent_chat_tab(state_prefix: str, agent_model_instance, tool_dispatch, ctx_builder):
+    """
+    state_prefix:        unique session-state/widget-key prefix for this
+                          agent chat (e.g. "agent" for Teacher, "student_agent"
+                          for Student). Also the `panel` name it's saved
+                          under in SQLite, so each persona's history is
+                          kept separate.
+    agent_model_instance: the genai.GenerativeModel configured with this
+                          persona's tools + system instruction.
+    tool_dispatch:        the execute_*_agent_tool function for this persona.
+    ctx_builder:          callable() -> dict returning fresh context for a
+                          new turn (pdf_text, student_df, sidebar values,
+                          etc.) — 'outputs' is filled in automatically from
+                          this tab's accumulated session state.
+
+    History is saved to / loaded from SQLite (see PERSISTENT CHAT HISTORY
+    above), keyed by the sidebar's "Your Name / ID" field, so it survives
+    app restarts and follows the same person across devices — same
+    treatment as the plain chat panels get.
+    """
+
+    conv_key = f"{state_prefix}_conversation"
+    chat_key = f"{state_prefix}_chat"
+    step_key = f"{state_prefix}_step"
+    outputs_key = f"{state_prefix}_outputs"
+    pending_q_key = f"{state_prefix}_pending_question"
+    pending_call_key = f"{state_prefix}_pending_call_name"
+    pending_plan_key = f"{state_prefix}_pending_plan_steps"
+    quiz_q_key = f"{state_prefix}_quiz_questions"
+    quiz_a_key = f"{state_prefix}_quiz_answers"
+    quiz_score_key = f"{state_prefix}_quiz_score"
+    loaded_flag_key = f"{state_prefix}_history_loaded"
+
+    defaults = [
+        (conv_key, []), (chat_key, None), (step_key, 0), (outputs_key, {}),
+        (pending_q_key, ""), (pending_call_key, ""), (pending_plan_key, []),
+        (quiz_q_key, []), (quiz_a_key, {}), (quiz_score_key, None),
+    ]
+    for key, default in defaults:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    def _reconstruct_from_turns(turns):
+        """Rebuilds outputs/quiz state from a list of saved turns —
+        shared by the initial DB load and the manual reload button."""
+        st.session_state[conv_key] = turns
+        st.session_state[chat_key] = None
+        st.session_state[outputs_key] = {}
+        for t in turns:
+            if t.get("kind") == "done":
+                st.session_state[outputs_key].update(t.get("outputs", {}))
+        if "Graded Quiz" in st.session_state[outputs_key]:
+            try:
+                st.session_state[quiz_q_key] = json.loads(
+                    _clean_json_block(st.session_state[outputs_key]["Graded Quiz"])
+                )
+            except Exception:
+                pass
+
+    # Load this user's saved conversation once per browser session.
+    if not st.session_state.get(loaded_flag_key):
+        st.session_state[loaded_flag_key] = True
+        loaded_turns = load_chat_history(get_current_user_id(), state_prefix)
+        if loaded_turns:
+            _reconstruct_from_turns(loaded_turns)
+
+    def _append_turn(turn):
+        st.session_state[conv_key].append(turn)
+        save_chat_turn(get_current_user_id(), state_prefix, turn["role"], turn)
+
+    def _build_ctx():
+        ctx = ctx_builder()
+        ctx["outputs"] = dict(st.session_state.get(outputs_key, {}))
+        return ctx
+
+    def _apply_state(state, ctx, steps_this_turn):
+        st.session_state[chat_key] = state.get("chat")
+        st.session_state[step_key] = state.get("step", 0)
+        st.session_state[outputs_key] = ctx.get("outputs", {})
+        st.session_state[pending_q_key] = ""
+        st.session_state[pending_call_key] = ""
+        st.session_state[pending_plan_key] = []
+
+        if state["status"] == "plan_ready":
+            st.session_state[pending_plan_key] = state["plan_steps"]
+            st.session_state[pending_call_key] = state["pending_call_name"]
+            return {"role": "assistant", "kind": "plan", "plan_steps": state["plan_steps"], "steps": steps_this_turn}
+        elif state["status"] == "needs_input":
+            st.session_state[pending_q_key] = state["pending_question"]
+            st.session_state[pending_call_key] = state["pending_call_name"]
+            return {"role": "assistant", "kind": "clarify", "question": state["pending_question"], "steps": steps_this_turn}
+        elif state["status"] == "done":
+            if ctx.get("quiz_questions"):
+                st.session_state[quiz_q_key] = ctx["quiz_questions"]
+            return {
+                "role": "assistant", "kind": "done", "content": state["final_text"],
+                "steps": steps_this_turn, "outputs": dict(ctx.get("outputs", {})),
+            }
+        else:
+            return {
+                "role": "assistant", "kind": "error",
+                "content": "The agent stopped early due to an error — see the steps above.",
+                "steps": steps_this_turn,
+            }
+
+    # ---- conversation history ----
+    for turn_index, turn in enumerate(st.session_state[conv_key]):
+        if turn["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(turn["content"])
+            continue
+
+        with st.chat_message("assistant"):
+            if turn.get("steps"):
+                with st.expander("🛠️ Steps taken", expanded=False):
+                    st.markdown("\n\n".join(turn["steps"]))
+
+            if turn["kind"] == "plan":
+                st.info("📋 **Proposed a plan:**")
+                for s in turn["plan_steps"]:
+                    st.markdown(f"- {s}")
+                st.caption(
+                    "(This was the plan at the time — see below if "
+                    "it's still awaiting your approval.)"
+                )
+            elif turn["kind"] == "clarify":
+                st.info(f"🤔 **Asked:** {turn['question']}")
+            elif turn["kind"] == "error":
+                st.error(turn["content"])
+            else:  # done
+                st.success(turn["content"])
+                for artifact_name, artifact_content in turn.get("outputs", {}).items():
+                    _render_agent_artifact(artifact_name, artifact_content, key_suffix=f"{state_prefix}hist{turn_index}")
+
+    # ---- pending plan approval ----
+    if st.session_state[pending_plan_key]:
+
+        with st.chat_message("assistant"):
+            st.info("📋 **Proposed plan — approve to run it:**")
+            for s in st.session_state[pending_plan_key]:
+                st.markdown(f"- {s}")
+
+            col_approve, col_cancel = st.columns(2)
+            with col_approve:
+                approve_clicked = st.button("▶️ Approve & Run", key=f"{state_prefix}_approve_plan", use_container_width=True)
+            with col_cancel:
+                cancel_clicked = st.button("✖️ Cancel", key=f"{state_prefix}_cancel_plan", use_container_width=True)
+
+            if cancel_clicked:
+                _append_turn({
+                    "role": "assistant", "kind": "error",
+                    "content": "Run cancelled before execution.", "steps": [],
+                })
+                st.session_state[pending_plan_key] = []
+                st.session_state[pending_call_key] = ""
+                st.rerun()
+
+            if approve_clicked:
+                ctx = _build_ctx()
+                log, status_box, steps_this_turn = _make_status_logger("🤖 Executing the approved plan...")
+                state = continue_agent_with_answer(
+                    st.session_state[chat_key],
+                    st.session_state[pending_call_key],
+                    "Approved. Proceed with the plan.",
+                    ctx, log=log, step=st.session_state[step_key],
+                    tool_dispatch=tool_dispatch,
+                )
+                turn = _apply_state(state, ctx, steps_this_turn)
+                _finish_status_box(status_box, state)
+                _append_turn(turn)
+                st.rerun()
+
+    # ---- pending clarifying question ----
+    elif st.session_state[pending_q_key]:
+
+        with st.chat_message("assistant"):
+            st.info(f"🤔 **Needs clarification:** {st.session_state[pending_q_key]}")
+
+            answer_text = st.text_input("Your answer", key=f"{state_prefix}_clarifying_answer")
+
+            if st.button("↩️ Send Answer", key=f"{state_prefix}_send_answer", use_container_width=True):
+                if not answer_text.strip():
+                    st.warning("Please enter an answer.")
+                else:
+                    _append_turn({"role": "user", "content": answer_text})
+                    ctx = _build_ctx()
+                    log, status_box, steps_this_turn = _make_status_logger("🤖 Continuing...")
+                    state = continue_agent_with_answer(
+                        st.session_state[chat_key],
+                        st.session_state[pending_call_key],
+                        answer_text, ctx, log=log, step=st.session_state[step_key],
+                        tool_dispatch=tool_dispatch,
+                    )
+                    turn = _apply_state(state, ctx, steps_this_turn)
+                    _finish_status_box(status_box, state)
+                    _append_turn(turn)
+                    st.rerun()
+
+    # ---- new message input ----
+    awaiting_response = bool(st.session_state[pending_plan_key] or st.session_state[pending_q_key])
+
+    new_message = st.chat_input(
+        "Ask the agent to prepare something, or send a follow-up...",
+        key=f"{state_prefix}_chat_input",
+        disabled=(agent_model_instance is None or awaiting_response),
+    )
+
+    if agent_model_instance is None:
+        st.error("Agent Mode needs GEMINI_API_KEY configured in Streamlit secrets.")
+
+    if new_message:
+        # Prior turns BEFORE this new message — if there's no live chat
+        # yet but these exist, this is a saved conversation resuming in
+        # a fresh browser session, so replay them into the new chat.
+        prior_turns = list(st.session_state[conv_key])
+
+        _append_turn({"role": "user", "content": new_message})
+        with st.chat_message("user"):
+            st.markdown(new_message)
+
+        ctx = _build_ctx()
+        log, status_box, steps_this_turn = _make_status_logger("🤖 Working on it...")
+
+        state = send_agent_message(
+            st.session_state[chat_key], new_message, ctx, log=log, step=0,
+            model=agent_model_instance, tool_dispatch=tool_dispatch,
+            history_turns=prior_turns,
+        )
+
+        turn = _apply_state(state, ctx, steps_this_turn)
+        _finish_status_box(status_box, state)
+        _append_turn(turn)
+        st.rerun()
+
+    # ---- metrics, course pack, export/import, clear ----
+    if st.session_state[outputs_key]:
+
+        st.markdown("---")
+
+        metric_cols = st.columns(3)
+        with metric_cols[0]:
+            st.metric("Artifacts produced", len(st.session_state[outputs_key]))
+        with metric_cols[1]:
+            st.metric("Steps taken (total)", st.session_state[step_key])
+        with metric_cols[2]:
+            st.metric("Interactive quiz", "Ready" if st.session_state[quiz_q_key] else "—")
+
+        try:
+            pack_bytes = generate_pdf_bytes(
+                build_course_pack_text(st.session_state[outputs_key]),
+                title="Course Prep Pack",
+            )
+            st.download_button(
+                label="📦 Download Full Course Pack (all artifacts, one PDF)",
+                data=pack_bytes,
+                file_name=f"{state_prefix}_course_pack.pdf",
+                mime="application/pdf",
+                key=f"pdf_download_{state_prefix}_course_pack",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning(f"Could not prepare the combined course pack: {e}")
+
+        st.caption(
+            "This conversation is also saved automatically on the server "
+            "under your sidebar ID — the JSON download/upload below is "
+            "just for taking a copy with you or viewing it in a browser "
+            "session that hasn't loaded your ID's saved history yet."
+        )
+
+        export_col, import_col = st.columns(2)
+
+        with export_col:
+            try:
+                history_json = json.dumps(st.session_state[conv_key], indent=2)
+                st.download_button(
+                    "💾 Download Chat History (JSON)",
+                    data=history_json,
+                    file_name=f"{state_prefix}_chat_history.json",
+                    mime="application/json",
+                    key=f"{state_prefix}_history_download",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Could not prepare chat history export: {e}")
+
+        with import_col:
+            uploaded_history = st.file_uploader(
+                "📤 Load previous chat history",
+                type=["json"],
+                key=f"{state_prefix}_history_upload",
+            )
+            if uploaded_history is not None:
+                try:
+                    loaded = json.loads(uploaded_history.read().decode("utf-8"))
+                    if isinstance(loaded, list):
+                        st.session_state[conv_key] = loaded
+                        st.success("Chat history loaded. Scroll up to view it.")
+                        st.rerun()
+                    else:
+                        st.error("That file doesn't look like a saved agent chat history.")
+                except Exception as e:
+                    st.error(f"Could not load that history file: {e}")
+
+        reload_col, clear_col = st.columns(2)
+
+        with reload_col:
+            if st.button("🔄 Reload History for This ID", key=f"{state_prefix}_reload_history"):
+                _reconstruct_from_turns(load_chat_history(get_current_user_id(), state_prefix))
+                st.rerun()
+
+        with clear_col:
+            if st.button("🗑️ Clear Conversation", key=f"{state_prefix}_clear_conversation"):
+                clear_chat_history(get_current_user_id(), state_prefix)
+                for key, default in defaults:
+                    st.session_state[key] = default
+                st.rerun()
+
+    # ---- interactive quiz ----
+    if st.session_state[quiz_q_key]:
+
+        st.markdown("---")
+        st.subheader("🎯 Take the Agent-Generated Quiz")
+
+        questions = st.session_state[quiz_q_key]
+
+        for index, item in enumerate(questions):
+            options = item.get("options", [])
+            if len(options) != 4:
+                continue
+            selected = st.radio(
+                f"{index + 1}. {item.get('question', '')}",
+                options, key=f"{state_prefix}_quiz_answer_{index}"
+            )
+            st.session_state[quiz_a_key][index] = selected
+
+        if st.button("✅ Submit Quiz", key=f"{state_prefix}_submit_quiz", use_container_width=True):
+            score = 0
+            for index, item in enumerate(questions):
+                options = item.get("options", [])
+                correct_index = item.get("answer")
+                if (
+                    index in st.session_state[quiz_a_key]
+                    and isinstance(correct_index, int)
+                    and 0 <= correct_index < len(options)
+                    and st.session_state[quiz_a_key][index] == options[correct_index]
+                ):
+                    score += 1
+            st.session_state[quiz_score_key] = score
+
+        if st.session_state[quiz_score_key] is not None:
+            total = len(questions)
+            score = st.session_state[quiz_score_key]
+            percentage = round((score / total) * 100, 1) if total else 0
+            st.success(f"🎉 Score: {score}/{total} ({percentage}%)")
+
+            for index, item in enumerate(questions):
+                options = item.get("options", [])
+                correct_index = item.get("answer")
+                if isinstance(correct_index, int) and 0 <= correct_index < len(options):
+                    correct_option = options[correct_index]
+                    if st.session_state[quiz_a_key].get(index) == correct_option:
+                        st.success(f"Q{index + 1}: Correct")
+                    else:
+                        st.error(f"Q{index + 1}: Incorrect. Correct answer: {correct_option}")
+                    st.caption(item.get("explanation", "No explanation provided."))
 
 
 # ============================================================
@@ -1063,6 +1770,122 @@ def is_gemini_error(response_text: str) -> bool:
 
 
 # ============================================================
+# PERSISTENT CHAT HISTORY (SQLite)
+# ============================================================
+#
+# st.session_state only lives for one browser session — it's gone the
+# moment the tab closes, and every device/browser hitting the same
+# deployed app gets its own empty history. This stores every chat turn
+# server-side in a SQLite file instead, keyed by a user ID the person
+# enters in the sidebar, so the same ID sees the same history from any
+# device, and it survives the app process restarting.
+#
+# HONEST LIMITATION: on Streamlit Community Cloud specifically, the
+# local filesystem persists while the app is just sleeping/waking, but
+# a full redeploy (new commit, or "reboot app") rebuilds the container
+# and wipes local files — including this .db file. For history that
+# survives redeploys too, swap CHAT_DB_PATH's sqlite3 connection for a
+# hosted database (e.g. Postgres via SQLAlchemy) — every function below
+# is isolated to this one section specifically so that swap only
+# touches this file, nothing that calls save_chat_turn/load_chat_history
+# needs to change.
+
+CHAT_DB_PATH = os.path.join(os.path.dirname(__file__), "chat_history.db")
+
+
+def get_db_connection():
+    conn = sqlite3.connect(CHAT_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_chat_db():
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                panel TEXT NOT NULL,
+                role TEXT NOT NULL,
+                turn_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_turns_user_panel
+            ON chat_turns (user_id, panel, id)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+init_chat_db()
+
+
+def get_current_user_id() -> str:
+    """The sidebar 'Your ID' field controls whose history is loaded/saved.
+    Defaults to 'guest' so the app works with zero setup — but everyone
+    who leaves it as 'guest' shares one history bucket, so multi-user
+    deployments should ask people to set a unique ID."""
+    return (st.session_state.get("chat_user_id") or "guest").strip() or "guest"
+
+
+def save_chat_turn(user_id: str, panel: str, role: str, turn: dict):
+    """Persists one turn. `turn` is any JSON-serializable dict — the
+    simple chat panels store {"role", "content"}; Agent Mode stores its
+    richer turn structure (kind, plan_steps, outputs, etc.) as-is."""
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO chat_turns (user_id, panel, role, turn_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                user_id,
+                panel,
+                role,
+                json.dumps(turn),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        st.warning(f"Could not save chat history: {e}")
+    finally:
+        conn.close()
+
+
+def load_chat_history(user_id: str, panel: str) -> list:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT turn_json FROM chat_turns WHERE user_id = ? AND panel = ? ORDER BY id ASC",
+            (user_id, panel),
+        ).fetchall()
+        return [json.loads(row["turn_json"]) for row in rows]
+    except Exception as e:
+        st.warning(f"Could not load saved chat history: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def clear_chat_history(user_id: str, panel: str):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "DELETE FROM chat_turns WHERE user_id = ? AND panel = ?",
+            (user_id, panel),
+        )
+        conn.commit()
+    except Exception as e:
+        st.warning(f"Could not clear saved chat history: {e}")
+    finally:
+        conn.close()
+
+
+# ============================================================
 # SHARED CHAT PANEL — interactive, multi-turn, with persisted history
 # ============================================================
 #
@@ -1072,26 +1895,29 @@ def is_gemini_error(response_text: str) -> bool:
 # Agent Mode's tool-calling loop, just an ordinary multi-turn chat).
 # Each panel keeps its own independent conversation + chat session,
 # scoped by `state_prefix`, so multiple panels on the same page don't
-# collide.
+# collide. History is loaded from / saved to SQLite (see above) so it
+# outlives the browser session and follows the same user ID across
+# devices — only the live Gemini chat session itself (needed for
+# multi-turn context) is per-browser-session, since that object can't
+# be serialized to a database.
 
 def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=None, empty_hint: str = None):
     """
-    state_prefix:        unique key prefix for this panel's session state.
+    state_prefix:        unique key prefix for this panel's session state
+                          AND the `panel` name it's saved under in SQLite.
     placeholder:         placeholder text for the chat input box.
     seed_prompt_builder: optional callable(first_message) -> str that
-                          wraps the FIRST message with extra context
-                          (e.g. PDF material, subject/topic, tone
-                          instructions). Follow-ups are sent as-is,
-                          since the model already has that context from
-                          the first turn of the conversation.
+                          wraps a message with extra context (e.g. PDF
+                          material, subject/topic, tone instructions).
     empty_hint:          optional caption shown before the first message.
     """
 
     conv_key = f"{state_prefix}_conversation"
     chat_key = f"{state_prefix}_chat_session"
+    user_id = get_current_user_id()
 
     if conv_key not in st.session_state:
-        st.session_state[conv_key] = []
+        st.session_state[conv_key] = load_chat_history(user_id, state_prefix)
     if chat_key not in st.session_state:
         st.session_state[chat_key] = None
 
@@ -1105,7 +1931,10 @@ def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=N
     user_message = st.chat_input(placeholder, key=f"{state_prefix}_chat_input")
 
     if user_message:
-        st.session_state[conv_key].append({"role": "user", "content": user_message})
+        user_turn = {"role": "user", "content": user_message}
+        st.session_state[conv_key].append(user_turn)
+        save_chat_turn(user_id, state_prefix, "user", user_turn)
+
         with st.chat_message("user"):
             st.markdown(user_message)
 
@@ -1114,14 +1943,40 @@ def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=N
                 if model is None:
                     answer = "Gemini model is not configured."
                 else:
-                    is_first_turn = st.session_state[chat_key] is None
+                    needs_new_session = st.session_state[chat_key] is None
 
-                    if is_first_turn:
-                        st.session_state[chat_key] = model.start_chat()
+                    if needs_new_session:
+                        # History before this new message (i.e. everything
+                        # loaded from the database, minus the message just
+                        # appended above) — if there's any, this is a
+                        # resumed conversation in a fresh browser session.
+                        prior_turns = st.session_state[conv_key][:-1]
 
-                    outgoing = user_message
-                    if is_first_turn and seed_prompt_builder:
-                        outgoing = seed_prompt_builder(user_message)
+                        if prior_turns:
+                            # Restore the model's actual conversational
+                            # memory, not just the visible transcript:
+                            # re-prime it with context, then replay the
+                            # real exchange so far.
+                            replay = []
+                            if seed_prompt_builder:
+                                context_only = seed_prompt_builder(
+                                    "(Continuing a previous conversation — no new question yet, just re-establishing context.)"
+                                )
+                                replay.append({"role": "user", "parts": [context_only]})
+                                replay.append({"role": "model", "parts": ["Understood — I have the context and I'm ready to continue."]})
+                            for t in prior_turns:
+                                api_role = "user" if t["role"] == "user" else "model"
+                                replay.append({"role": api_role, "parts": [t["content"]]})
+                            st.session_state[chat_key] = model.start_chat(history=replay)
+                            outgoing = user_message
+                        else:
+                            st.session_state[chat_key] = model.start_chat()
+                            outgoing = (
+                                seed_prompt_builder(user_message)
+                                if seed_prompt_builder else user_message
+                            )
+                    else:
+                        outgoing = user_message
 
                     try:
                         response = st.session_state[chat_key].send_message(outgoing)
@@ -1134,7 +1989,9 @@ def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=N
 
             st.markdown(answer)
 
-        st.session_state[conv_key].append({"role": "assistant", "content": answer})
+        assistant_turn = {"role": "assistant", "content": answer}
+        st.session_state[conv_key].append(assistant_turn)
+        save_chat_turn(user_id, state_prefix, "assistant", assistant_turn)
 
         if not is_gemini_error(answer):
             render_pdf_download_button(
@@ -1144,11 +2001,21 @@ def render_chat_panel(state_prefix: str, placeholder: str, seed_prompt_builder=N
                 key=f"pdf_download_{state_prefix}_{len(st.session_state[conv_key])}",
             )
 
-    if st.session_state[conv_key]:
-        if st.button("🗑️ Clear Chat", key=f"{state_prefix}_clear_chat"):
-            st.session_state[conv_key] = []
+    reload_col, clear_col = st.columns(2)
+
+    with reload_col:
+        if st.button("🔄 Reload History", key=f"{state_prefix}_reload"):
+            st.session_state[conv_key] = load_chat_history(user_id, state_prefix)
             st.session_state[chat_key] = None
             st.rerun()
+
+    with clear_col:
+        if st.session_state[conv_key]:
+            if st.button("🗑️ Clear Chat", key=f"{state_prefix}_clear_chat"):
+                clear_chat_history(user_id, state_prefix)
+                st.session_state[conv_key] = []
+                st.session_state[chat_key] = None
+                st.rerun()
 
 
 # ============================================================
@@ -1527,16 +2394,6 @@ _DEFAULT_STATE = {
     "quiz_score": None,
     "student_analysis_response": "",
     "uploaded_student_data": None,
-    "agent_conversation": [],
-    "agent_outputs": {},
-    "agent_chat": None,
-    "agent_step": 0,
-    "agent_pending_question": "",
-    "agent_pending_call_name": "",
-    "agent_pending_plan_steps": [],
-    "agent_quiz_questions": [],
-    "agent_quiz_answers": {},
-    "agent_quiz_score": None,
 }
 
 for _key, _default in _DEFAULT_STATE.items():
@@ -1562,6 +2419,19 @@ st.markdown(
 # ============================================================
 
 st.sidebar.title("⚙️ Assistant Settings")
+
+st.session_state.chat_user_id = st.sidebar.text_input(
+    "Your Name / ID (for saved chat history)",
+    value=st.session_state.get("chat_user_id", "guest"),
+    help=(
+        "Chats are saved on the server under this ID, so they survive "
+        "app restarts and follow you across devices. Anyone who leaves "
+        "this as 'guest' shares one saved history — set a unique ID to "
+        "keep yours separate. If you change this mid-session, use a "
+        "panel's 'Reload History' button (or refresh the page) to pick "
+        "up that ID's saved chats."
+    ),
+)
 
 user_mode = st.sidebar.selectbox(
     "Select Mode",
@@ -2547,423 +3417,21 @@ Teacher's first request:
                 "requests can build on earlier artifacts."
             )
 
-        # ----------------------------------------------------------------
-        # Shared helpers for this tab
-        # ----------------------------------------------------------------
-
-        def _agent_build_ctx():
+        def _teacher_agent_ctx_builder():
             return {
                 "pdf_text": st.session_state.get("pdf_text", ""),
                 "student_df": st.session_state.get("uploaded_student_data"),
                 "education_level": education_level,
                 "language": response_language,
-                # Carry forward everything produced so far in this
-                # conversation, so a follow-up turn adds to it instead of
-                # wiping it out.
-                "outputs": dict(st.session_state.get("agent_outputs", {})),
             }
 
-        def _agent_new_turn_logger(label):
-            """Same live st.status() treatment as before, but scoped to a
-            single conversation turn's own step list, so each turn in the
-            history keeps its own trace instead of one giant shared log."""
-            turn_log_lines = []
-            status_box = st.status(label, expanded=True)
-            log_area = status_box.empty()
-            log_area.markdown("_Starting up..._")
-
-            def _log(msg):
-                turn_log_lines.append(msg)
-                log_area.markdown("\n\n".join(turn_log_lines))
-
-            return _log, status_box, turn_log_lines
-
-        def _agent_finish_status(status_box, state):
-            if state["status"] == "done":
-                status_box.update(label="✅ Done", state="complete")
-            elif state["status"] == "plan_ready":
-                status_box.update(label="📋 Waiting for plan approval", state="complete")
-            elif state["status"] == "needs_input":
-                status_box.update(label="❓ Waiting for your answer", state="complete")
-            else:
-                status_box.update(label="⚠️ Stopped early", state="error")
-
-        def _agent_apply_state(state, ctx, steps_this_turn):
-            """Updates session state after any agent call and returns the
-            assistant turn record to append to the visible conversation."""
-
-            st.session_state.agent_chat = state.get("chat")
-            st.session_state.agent_step = state.get("step", 0)
-            st.session_state.agent_outputs = ctx.get("outputs", {})
-
-            st.session_state.agent_pending_question = ""
-            st.session_state.agent_pending_call_name = ""
-            st.session_state.agent_pending_plan_steps = []
-
-            new_outputs = {}
-
-            if state["status"] == "plan_ready":
-                st.session_state.agent_pending_plan_steps = state["plan_steps"]
-                st.session_state.agent_pending_call_name = state["pending_call_name"]
-                turn = {
-                    "role": "assistant",
-                    "kind": "plan",
-                    "plan_steps": state["plan_steps"],
-                    "steps": steps_this_turn,
-                }
-            elif state["status"] == "needs_input":
-                st.session_state.agent_pending_question = state["pending_question"]
-                st.session_state.agent_pending_call_name = state["pending_call_name"]
-                turn = {
-                    "role": "assistant",
-                    "kind": "clarify",
-                    "question": state["pending_question"],
-                    "steps": steps_this_turn,
-                }
-            elif state["status"] == "done":
-                if ctx.get("quiz_questions"):
-                    st.session_state.agent_quiz_questions = ctx["quiz_questions"]
-                turn = {
-                    "role": "assistant",
-                    "kind": "done",
-                    "content": state["final_text"],
-                    "steps": steps_this_turn,
-                    "outputs": dict(ctx.get("outputs", {})),
-                }
-            else:
-                turn = {
-                    "role": "assistant",
-                    "kind": "error",
-                    "content": "The agent stopped early due to an error — see the steps above.",
-                    "steps": steps_this_turn,
-                }
-
-            return turn
-
-        def _render_artifact(artifact_name, artifact_content, key_suffix):
-            st.markdown(f"**{artifact_name}**")
-            if artifact_name in ("Practice MCQs", "Graded Quiz"):
-                st.caption(
-                    "Raw generated JSON — see the interactive quiz below "
-                    "if this is the graded quiz."
-                )
-                st.code(artifact_content, language="json")
-            else:
-                st.markdown(artifact_content)
-
-            render_pdf_download_button(
-                artifact_content,
-                title=artifact_name,
-                filename=f"{artifact_name.lower().replace(' ', '_')}.pdf",
-                key=f"pdf_download_agent_{key_suffix}_{artifact_name}",
-            )
-
-        # ----------------------------------------------------------------
-        # Conversation history — every past exchange, replayed on every
-        # rerun so the chat looks and behaves like a normal chat thread.
-        # ----------------------------------------------------------------
-
-        for turn_index, turn in enumerate(st.session_state.get("agent_conversation", [])):
-
-            if turn["role"] == "user":
-                with st.chat_message("user"):
-                    st.markdown(turn["content"])
-                continue
-
-            with st.chat_message("assistant"):
-
-                if turn.get("steps"):
-                    with st.expander("🛠️ Steps taken", expanded=False):
-                        st.markdown("\n\n".join(turn["steps"]))
-
-                if turn["kind"] == "plan":
-                    st.info("📋 **Proposed a plan:**")
-                    for s in turn["plan_steps"]:
-                        st.markdown(f"- {s}")
-                    st.caption(
-                        "(This was the plan at the time — see below if "
-                        "it's still awaiting your approval.)"
-                    )
-
-                elif turn["kind"] == "clarify":
-                    st.info(f"🤔 **Asked:** {turn['question']}")
-
-                elif turn["kind"] == "error":
-                    st.error(turn["content"])
-
-                else:  # done
-                    st.success(turn["content"])
-                    for artifact_name, artifact_content in turn.get("outputs", {}).items():
-                        _render_artifact(artifact_name, artifact_content, key_suffix=f"hist{turn_index}")
-
-        # ----------------------------------------------------------------
-        # Pending plan approval / clarifying question — always rendered
-        # as the latest assistant turn, with live controls attached.
-        # ----------------------------------------------------------------
-
-        if st.session_state.get("agent_pending_plan_steps"):
-
-            with st.chat_message("assistant"):
-                st.info("📋 **Proposed plan — approve to run it:**")
-                for s in st.session_state.agent_pending_plan_steps:
-                    st.markdown(f"- {s}")
-
-                col_approve, col_cancel = st.columns(2)
-                with col_approve:
-                    approve_clicked = st.button(
-                        "▶️ Approve & Run", key="agent_approve_plan", use_container_width=True
-                    )
-                with col_cancel:
-                    cancel_clicked = st.button(
-                        "✖️ Cancel", key="agent_cancel_plan", use_container_width=True
-                    )
-
-                if cancel_clicked:
-                    st.session_state.agent_conversation.append({
-                        "role": "assistant",
-                        "kind": "error",
-                        "content": "Run cancelled before execution.",
-                        "steps": [],
-                    })
-                    st.session_state.agent_pending_plan_steps = []
-                    st.session_state.agent_pending_call_name = ""
-                    st.rerun()
-
-                if approve_clicked:
-                    ctx = _agent_build_ctx()
-                    log, status_box, steps_this_turn = _agent_new_turn_logger(
-                        "🤖 Executing the approved plan..."
-                    )
-                    state = continue_agent_with_answer(
-                        st.session_state.agent_chat,
-                        st.session_state.agent_pending_call_name,
-                        "Approved. Proceed with the plan.",
-                        ctx,
-                        log=log,
-                        step=st.session_state.get("agent_step", 0),
-                    )
-                    turn = _agent_apply_state(state, ctx, steps_this_turn)
-                    _agent_finish_status(status_box, state)
-                    st.session_state.agent_conversation.append(turn)
-                    st.rerun()
-
-        elif st.session_state.get("agent_pending_question"):
-
-            with st.chat_message("assistant"):
-                st.info(f"🤔 **Needs clarification:** {st.session_state.agent_pending_question}")
-
-                clarifying_answer = st.text_input("Your answer", key="agent_clarifying_answer")
-
-                if st.button("↩️ Send Answer", key="agent_send_answer", use_container_width=True):
-                    if not clarifying_answer.strip():
-                        st.warning("Please enter an answer.")
-                    else:
-                        st.session_state.agent_conversation.append({
-                            "role": "user", "content": clarifying_answer
-                        })
-                        ctx = _agent_build_ctx()
-                        log, status_box, steps_this_turn = _agent_new_turn_logger(
-                            "🤖 Continuing..."
-                        )
-                        state = continue_agent_with_answer(
-                            st.session_state.agent_chat,
-                            st.session_state.agent_pending_call_name,
-                            clarifying_answer,
-                            ctx,
-                            log=log,
-                            step=st.session_state.get("agent_step", 0),
-                        )
-                        turn = _agent_apply_state(state, ctx, steps_this_turn)
-                        _agent_finish_status(status_box, state)
-                        st.session_state.agent_conversation.append(turn)
-                        st.rerun()
-
-        # ----------------------------------------------------------------
-        # New message input — disabled while a plan/question is pending,
-        # since those have their own controls above.
-        # ----------------------------------------------------------------
-
-        awaiting_response = bool(
-            st.session_state.get("agent_pending_plan_steps")
-            or st.session_state.get("agent_pending_question")
+        render_agent_chat_tab(
+            state_prefix="agent",
+            agent_model_instance=agent_model,
+            tool_dispatch=execute_agent_tool,
+            ctx_builder=_teacher_agent_ctx_builder,
         )
 
-        new_message = st.chat_input(
-            "Ask the agent to prepare something, or send a follow-up...",
-            disabled=(agent_model is None or awaiting_response),
-        )
-
-        if agent_model is None:
-            st.error("Agent Mode needs GEMINI_API_KEY configured in Streamlit secrets.")
-
-        if new_message:
-            st.session_state.agent_conversation.append({"role": "user", "content": new_message})
-
-            with st.chat_message("user"):
-                st.markdown(new_message)
-
-            ctx = _agent_build_ctx()
-            log, status_box, steps_this_turn = _agent_new_turn_logger("🤖 Working on it...")
-
-            state = send_agent_message(
-                st.session_state.get("agent_chat"),
-                new_message,
-                ctx,
-                log=log,
-                step=0,
-            )
-
-            turn = _agent_apply_state(state, ctx, steps_this_turn)
-            _agent_finish_status(status_box, state)
-            st.session_state.agent_conversation.append(turn)
-            st.rerun()
-
-        # ----------------------------------------------------------------
-        # Conversation-level extras: metrics, course pack, interactive quiz
-        # ----------------------------------------------------------------
-
-        if st.session_state.get("agent_outputs"):
-
-            st.markdown("---")
-
-            metric_cols = st.columns(3)
-            with metric_cols[0]:
-                st.metric("Artifacts produced", len(st.session_state.agent_outputs))
-            with metric_cols[1]:
-                st.metric("Steps taken (total)", st.session_state.get("agent_step", 0))
-            with metric_cols[2]:
-                st.metric(
-                    "Interactive quiz",
-                    "Ready" if st.session_state.get("agent_quiz_questions") else "—"
-                )
-
-            try:
-                pack_bytes = generate_pdf_bytes(
-                    build_course_pack_text(st.session_state.agent_outputs),
-                    title="Course Prep Pack",
-                )
-                st.download_button(
-                    label="📦 Download Full Course Pack (all artifacts, one PDF)",
-                    data=pack_bytes,
-                    file_name="course_pack.pdf",
-                    mime="application/pdf",
-                    key="pdf_download_agent_course_pack",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.warning(f"Could not prepare the combined course pack: {e}")
-
-            # Conversation export/import — since Streamlit has no built-in
-            # persistent storage, this is how the chat survives beyond the
-            # current running session (a new session can reload it to see
-            # the transcript, though a fresh live agent chat starts if you
-            # send a new message).
-            export_col, import_col = st.columns(2)
-
-            with export_col:
-                try:
-                    import json as _json
-                    history_json = _json.dumps(
-                        st.session_state.agent_conversation, indent=2
-                    )
-                    st.download_button(
-                        "💾 Download Chat History (JSON)",
-                        data=history_json,
-                        file_name="agent_chat_history.json",
-                        mime="application/json",
-                        key="agent_history_download",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.warning(f"Could not prepare chat history export: {e}")
-
-            with import_col:
-                uploaded_history = st.file_uploader(
-                    "📤 Load previous chat history",
-                    type=["json"],
-                    key="agent_history_upload",
-                    label_visibility="visible",
-                )
-                if uploaded_history is not None:
-                    try:
-                        import json as _json
-                        loaded = _json.loads(uploaded_history.read().decode("utf-8"))
-                        if isinstance(loaded, list):
-                            st.session_state.agent_conversation = loaded
-                            st.success("Chat history loaded. Scroll up to view it.")
-                            st.rerun()
-                        else:
-                            st.error("That file doesn't look like a saved agent chat history.")
-                    except Exception as e:
-                        st.error(f"Could not load that history file: {e}")
-
-            if st.button("🗑️ Clear Conversation", key="agent_clear_conversation"):
-                st.session_state.agent_conversation = []
-                st.session_state.agent_chat = None
-                st.session_state.agent_step = 0
-                st.session_state.agent_outputs = {}
-                st.session_state.agent_quiz_questions = []
-                st.session_state.agent_quiz_answers = {}
-                st.session_state.agent_quiz_score = None
-                st.session_state.agent_pending_question = ""
-                st.session_state.agent_pending_call_name = ""
-                st.session_state.agent_pending_plan_steps = []
-                st.rerun()
-
-        # ----------------------------------------------------------------
-        # Interactive quiz — the agent's JSON gets rendered as a real,
-        # takeable quiz instead of a text dump.
-        # ----------------------------------------------------------------
-
-        if st.session_state.get("agent_quiz_questions"):
-
-            st.markdown("---")
-            st.subheader("🎯 Take the Agent-Generated Quiz")
-
-            questions = st.session_state.agent_quiz_questions
-
-            for index, item in enumerate(questions):
-                options = item.get("options", [])
-                if len(options) != 4:
-                    continue
-
-                selected = st.radio(
-                    f"{index + 1}. {item.get('question', '')}",
-                    options,
-                    key=f"agent_quiz_answer_{index}"
-                )
-                st.session_state.agent_quiz_answers[index] = selected
-
-            if st.button("✅ Submit Quiz", key="agent_submit_quiz", use_container_width=True):
-                score = 0
-                for index, item in enumerate(questions):
-                    options = item.get("options", [])
-                    correct_index = item.get("answer")
-                    if (
-                        index in st.session_state.agent_quiz_answers
-                        and isinstance(correct_index, int)
-                        and 0 <= correct_index < len(options)
-                        and st.session_state.agent_quiz_answers[index] == options[correct_index]
-                    ):
-                        score += 1
-                st.session_state.agent_quiz_score = score
-
-            if st.session_state.get("agent_quiz_score") is not None:
-                total = len(questions)
-                score = st.session_state.agent_quiz_score
-                percentage = round((score / total) * 100, 1) if total else 0
-                st.success(f"🎉 Score: {score}/{total} ({percentage}%)")
-
-                for index, item in enumerate(questions):
-                    options = item.get("options", [])
-                    correct_index = item.get("answer")
-                    if isinstance(correct_index, int) and 0 <= correct_index < len(options):
-                        correct_option = options[correct_index]
-                        if st.session_state.agent_quiz_answers.get(index) == correct_option:
-                            st.success(f"Q{index + 1}: Correct")
-                        else:
-                            st.error(f"Q{index + 1}: Incorrect. Correct answer: {correct_option}")
-                        st.caption(item.get("explanation", "No explanation provided."))
 
 
 
@@ -2980,6 +3448,7 @@ else:
         "📝 Practice MCQs",
         "🎯 Take Quiz",
         "📄 PDF Assistant",
+        "🤖 Agent Mode",
     ])
 
     # --------------------------------------------------------
@@ -3672,6 +4141,60 @@ Student's first question:
                 seed_prompt_builder=_student_pdf_seed,
                 empty_hint="Ask a question about the uploaded material to start the conversation.",
             )
+
+    # --------------------------------------------------------
+    # STUDENT — AGENT MODE
+    # --------------------------------------------------------
+
+    with student_tabs[6]:
+
+        st.header("🤖 Personal Study Agent")
+
+        st.write(
+            "Chat with the agent instead of filling a form. It remembers "
+            "everything produced earlier in this conversation, so follow-ups "
+            "like *\"now quiz me on that\"* or *\"explain it more simply\"* "
+            "build on what's already there — planning each new request and "
+            "waiting for your approval before acting, asking you when "
+            "something's genuinely unclear, and double-checking its own "
+            "work before calling itself done."
+        )
+
+        with st.expander("What can the agent do on its own?"):
+            st.markdown(
+                "- 📋 Propose a plan for each new request and wait for "
+                "your approval before doing anything\n"
+                "- 📄 Read your previously uploaded study material PDF\n"
+                "- 🧠 Teach you a topic from the basics\n"
+                "- 💡 Explain a specific doubt or point of confusion\n"
+                "- 📓 Write study notes on a topic\n"
+                "- 📝 Generate practice MCQs\n"
+                "- 🎯 Generate a graded quiz (takeable right here, not "
+                "just a text dump)\n"
+                "- ❓ Ask you a clarifying question if it genuinely can't "
+                "tell what you want\n"
+                "- 🔍 Review its own output against your request before "
+                "finishing, and fix gaps it finds\n\n"
+                "It can call several of these in the same step when they "
+                "don't depend on each other, instead of one at a time — "
+                "and it keeps the whole conversation in memory, so later "
+                "requests can build on earlier lessons and notes."
+            )
+
+        def _student_agent_ctx_builder():
+            return {
+                "pdf_text": st.session_state.get("pdf_text", ""),
+                "education_level": education_level,
+                "difficulty": difficulty,
+                "language": response_language,
+            }
+
+        render_agent_chat_tab(
+            state_prefix="student_agent",
+            agent_model_instance=student_agent_model,
+            tool_dispatch=execute_student_agent_tool,
+            ctx_builder=_student_agent_ctx_builder,
+        )
 
 
 # ============================================================
